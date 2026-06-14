@@ -7,6 +7,7 @@ Wave 4 (S04): result base, base params, error object, empty result.
 Wave 5 (S05, S18, S19): _meta object, pagination, response caching.
 Wave 6 (S06, S07, S17, S22, S23): stateless model, protocol revision,
   multi-round-trip requests, progress & cancellation, logging & trace context.
+Wave 7 (S08, S12): discovery via server/discover, transport model & guarantees.
 """
 
 from mcp_sdk_py.foundations import (
@@ -250,12 +251,14 @@ from mcp_sdk_py.progress import (
   DISCOVER_METHOD,
   PROGRESS_NOTIFICATION_METHOD,
   CancelledNotificationParams,
+  CancellationRegistry,
   CancellationTargetNotInFlightError,
   ProgressNotificationParams,
   ProgressNotOptedInError,
   ProgressTracker,
   build_cancel_notification,
   is_cancellable_method,
+  receive_cancellation,
   validate_cancelled_notification_params,
   validate_progress_notification_params,
   validate_progress_opt_in,
@@ -274,6 +277,33 @@ from mcp_sdk_py.logging_utils import (
   validate_known_logging_level,
   validate_logging_message_notification_params,
   validate_trace_context_values,
+)
+from mcp_sdk_py.discovery import (
+  DISCOVER_METHOD_NAME,
+  DISCOVER_REQUIRED_META_KEYS,
+  DiscoverResult,
+  DiscoverResultResponse,
+  EmptySupportedVersionsError,
+  InvalidServerInfoError,
+  MissingDiscoverMetaKeyError,
+  build_unsupported_version_error_data,
+  check_discover_revision,
+  validate_discover_request_meta,
+  validate_discover_result,
+)
+from mcp_sdk_py.transport import (
+  DEFINED_TRANSPORTS,
+  TRANSPORT_STDIO,
+  TRANSPORT_STREAMABLE_HTTP,
+  ConnectionScopedStateError,
+  CustomTransportChecklist,
+  DisconnectionError,
+  MalformedMessageError,
+  MessageDeliveryError,
+  TransportError,
+  assert_no_connection_scoped_state,
+  fail_in_flight_on_disconnect,
+  validate_utf8_json_unit,
 )
 from mcp_sdk_py.lifecycle import (
   DEPRECATED_FEATURE_NAMES,
@@ -524,12 +554,14 @@ __all__ = [
   "DISCOVER_METHOD",
   "PROGRESS_NOTIFICATION_METHOD",
   "CancelledNotificationParams",
+  "CancellationRegistry",
   "CancellationTargetNotInFlightError",
   "ProgressNotificationParams",
   "ProgressNotOptedInError",
   "ProgressTracker",
   "build_cancel_notification",
   "is_cancellable_method",
+  "receive_cancellation",
   "validate_cancelled_notification_params",
   "validate_progress_notification_params",
   "validate_progress_opt_in",
@@ -547,6 +579,31 @@ __all__ = [
   "validate_known_logging_level",
   "validate_logging_message_notification_params",
   "validate_trace_context_values",
+  # S08 — discovery
+  "DISCOVER_METHOD_NAME",
+  "DISCOVER_REQUIRED_META_KEYS",
+  "DiscoverResult",
+  "DiscoverResultResponse",
+  "EmptySupportedVersionsError",
+  "InvalidServerInfoError",
+  "MissingDiscoverMetaKeyError",
+  "build_unsupported_version_error_data",
+  "check_discover_revision",
+  "validate_discover_request_meta",
+  "validate_discover_result",
+  # S12 — transport model
+  "DEFINED_TRANSPORTS",
+  "TRANSPORT_STDIO",
+  "TRANSPORT_STREAMABLE_HTTP",
+  "ConnectionScopedStateError",
+  "CustomTransportChecklist",
+  "DisconnectionError",
+  "MalformedMessageError",
+  "MessageDeliveryError",
+  "TransportError",
+  "assert_no_connection_scoped_state",
+  "fail_in_flight_on_disconnect",
+  "validate_utf8_json_unit",
   # S43 — lifecycle
   "DEPRECATED_FEATURE_NAMES",
   "DEPRECATED_FEATURES_REGISTRY",
