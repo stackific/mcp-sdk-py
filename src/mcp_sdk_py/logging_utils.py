@@ -272,3 +272,57 @@ def validate_trace_context_values(meta: dict[str, Any]) -> dict[str, str]:
       validator(value)  # raises ValueError on invalid format
       result[key] = value
   return result
+
+
+# ---------------------------------------------------------------------------
+# §15.3  Log-data redaction safety net
+# ---------------------------------------------------------------------------
+
+#: Key names (lowercased) that commonly carry secrets.  Callers SHOULD pass
+#: log data through :func:`redact_log_data` before sending it in a
+#: ``notifications/message`` payload to prevent accidental secret leakage.
+_DEFAULT_SENSITIVE_KEYS: frozenset[str] = frozenset({
+  "password",
+  "secret",
+  "token",
+  "api_key",
+  "apikey",
+  "auth",
+  "authorization",
+  "credential",
+  "credentials",
+  "key",
+})
+
+
+def redact_log_data(
+  data: Any,
+  *,
+  sensitive_keys: frozenset[str] | None = None,
+) -> Any:
+  """Recursively replace sensitive key values with ``"[REDACTED]"`` (S23 Bucket B).
+
+  A safety net against accidental secret leakage in log payloads.  Pass log
+  ``data`` through this helper before including it in a ``notifications/message``
+  notification.  Key matching is case-insensitive against the sensitive-keys set.
+
+  Args:
+    data: any JSON-compatible value (dict, list, scalar, None).
+    sensitive_keys: override the built-in set of secret-bearing key names.
+      When ``None``, :data:`_DEFAULT_SENSITIVE_KEYS` is used.
+
+  Returns:
+    A copy of ``data`` with matching key values replaced by ``"[REDACTED]"``.
+    Non-dict/list values are returned unchanged.
+  """
+  if sensitive_keys is None:
+    sensitive_keys = _DEFAULT_SENSITIVE_KEYS
+  if isinstance(data, dict):
+    return {
+      k: "[REDACTED]" if k.lower() in sensitive_keys
+      else redact_log_data(v, sensitive_keys=sensitive_keys)
+      for k, v in data.items()
+    }
+  if isinstance(data, list):
+    return [redact_log_data(item, sensitive_keys=sensitive_keys) for item in data]
+  return data

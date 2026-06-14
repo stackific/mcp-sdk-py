@@ -1,6 +1,6 @@
 """Tests for S06 — Stateless Per-Request Model & Cross-Call Continuity.
 
-Coverage map (16 ACs):
+Coverage map (19 ACs):
   AC-06.1  → TestIndependentProcessing
   AC-06.2  → TestNoHandshakeRequired
   AC-06.3  → TestSelfDescribingIdentity
@@ -17,10 +17,15 @@ Coverage map (16 ACs):
   AC-06.14 → TestContinuationAcrossConnections
   AC-06.15 → TestListResultConnectionIndependence
   AC-06.16 → TestListResultVariationFromInputsOnly
+  AC-06.17 → TestMultipleTasksOverTransport
+  AC-06.18 → TestContinuationIdAcrossTransportPairs
+  AC-06.19 → TestResumeAfterTransportClose
 """
 
 import pytest
 
+from mcp_sdk_py.jsonrpc import JSONRPCRequest
+from mcp_sdk_py.transport import InMemoryTransport
 from mcp_sdk_py.stateless_model import (
   LISTING_METHODS,
   InvalidContinuationIdError,
@@ -341,3 +346,171 @@ class TestListResultVariationFromInputsOnly:
   def test_is_listing_method_returns_false_for_unknown(self):
     assert not is_listing_method("custom/list")
     assert not is_listing_method("")
+
+
+# ---------------------------------------------------------------------------
+# AC-06.17 — Multiple tasks on one transport connection  (R-4.4-h)
+# ---------------------------------------------------------------------------
+
+class TestMultipleTasksOverTransport:
+  """AC-06.17: Multiple independent tasks can be sent over one transport pair (R-4.4-h).
+
+  Demonstrates that the stateless request model requires no per-task connection
+  state: two requests with different IDs and independent _meta travel over the
+  same InMemoryTransport pair without interference.
+  """
+
+  def test_two_requests_sent_received_over_one_transport(self):
+    """Two independent requests sent through one transport pair arrive intact."""
+    client, server = InMemoryTransport.create_pair()
+    req_a = JSONRPCRequest(
+      id=1, method="tools/list",
+      params={"_meta": {**_FULL_META}},
+    )
+    req_b = JSONRPCRequest(
+      id=2, method="resources/list",
+      params={"_meta": {**_FULL_META}},
+    )
+    client.send(req_a)
+    client.send(req_b)
+    received_a = server.receive()
+    received_b = server.receive()
+    assert received_a.id == 1
+    assert received_b.id == 2
+    assert received_a.method == "tools/list"
+    assert received_b.method == "resources/list"
+
+  def test_requests_are_independent_after_transit(self):
+    """Received requests carry fully independent params — no cross-contamination."""
+    client, server = InMemoryTransport.create_pair()
+    req_a = JSONRPCRequest(
+      id=10, method="tools/list",
+      params={"_meta": {**_FULL_META, "x-task": "task-A"}},
+    )
+    req_b = JSONRPCRequest(
+      id=11, method="tools/list",
+      params={"_meta": {**_FULL_META, "x-task": "task-B"}},
+    )
+    client.send(req_a)
+    client.send(req_b)
+    recv_a = server.receive()
+    recv_b = server.receive()
+    assert recv_a.params["_meta"]["x-task"] == "task-A"
+    assert recv_b.params["_meta"]["x-task"] == "task-B"
+
+  def test_self_describing_meta_valid_after_transit(self):
+    """assert_request_is_self_describing passes for a request received over transport."""
+    client, server = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(
+      id=99, method="tools/list",
+      params={"_meta": {**_FULL_META}},
+    )
+    client.send(req)
+    received = server.receive()
+    assert_request_is_self_describing(received.params["_meta"])  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# AC-06.18 — Related ops across transport connections  (R-4.4-i)
+# ---------------------------------------------------------------------------
+
+class TestContinuationIdAcrossTransportPairs:
+  """AC-06.18: A continuation_id is valid across different transport pairs (R-4.4-i).
+
+  Demonstrates that continuations live in the _meta payload, not in connection
+  state: the same continuation_id travels successfully over a fresh transport pair.
+  """
+
+  def test_continuation_id_valid_on_second_transport_pair(self):
+    """A continuation_id sent on connection 1 is equally valid on connection 2."""
+    continuation = "cont-abc-123"
+    # first connection — establish the continuation
+    c1, s1 = InMemoryTransport.create_pair()
+    req1 = JSONRPCRequest(
+      id=1, method="tools/list",
+      params={"_meta": {**_FULL_META, "continuationId": continuation}},
+    )
+    c1.send(req1)
+    recv1 = s1.receive()
+    assert recv1.params["_meta"]["continuationId"] == continuation
+
+    # second connection — same continuation_id, entirely new transport
+    c2, s2 = InMemoryTransport.create_pair()
+    req2 = JSONRPCRequest(
+      id=2, method="tools/list",
+      params={"_meta": {**_FULL_META, "continuationId": continuation}},
+    )
+    c2.send(req2)
+    recv2 = s2.receive()
+    assert recv2.params["_meta"]["continuationId"] == continuation
+    assert continuation_ids_are_equal(
+      recv1.params["_meta"]["continuationId"],
+      recv2.params["_meta"]["continuationId"],
+    )
+
+  def test_different_tasks_with_same_continuation_id_both_self_describing(self):
+    """Two separate transport pairs carrying the same continuation_id both pass validation."""
+    continuation = "shared-cont"
+    for _ in range(2):
+      c, s = InMemoryTransport.create_pair()
+      req = JSONRPCRequest(
+        id=1, method="tools/list",
+        params={"_meta": {**_FULL_META, "continuationId": continuation}},
+      )
+      c.send(req)
+      received = s.receive()
+      # assert_request_is_self_describing only checks required _meta keys, not continuationId
+      assert_request_is_self_describing(received.params["_meta"])
+
+
+# ---------------------------------------------------------------------------
+# AC-06.19 — Resume after transport close  (R-4.4-j)
+# ---------------------------------------------------------------------------
+
+class TestResumeAfterTransportClose:
+  """AC-06.19: Requests with a continuation_id succeed after the prior connection closes (R-4.4-j).
+
+  Demonstrates that closing a transport does not invalidate continuation_ids:
+  a fresh transport pair accepts the same self-describing request immediately.
+  """
+
+  def test_request_valid_after_prior_transport_close(self):
+    """After closing a transport, the same request is accepted on a new pair."""
+    continuation = "resume-cont-xyz"
+    # first connection — send, then close
+    c1, s1 = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(
+      id=1, method="tools/list",
+      params={"_meta": {**_FULL_META, "continuationId": continuation}},
+    )
+    c1.send(req)
+    s1.receive()  # consume the message
+    c1.close()
+    s1.close()
+    assert c1.is_closed
+    assert s1.is_closed
+
+    # second connection — works identically without any shared state
+    c2, s2 = InMemoryTransport.create_pair()
+    req2 = JSONRPCRequest(
+      id=2, method="tools/list",
+      params={"_meta": {**_FULL_META, "continuationId": continuation}},
+    )
+    c2.send(req2)
+    received = s2.receive()
+    assert received.params["_meta"]["continuationId"] == continuation
+
+  def test_closed_connection_state_does_not_bleed_into_new_pair(self):
+    """Closing one InMemoryTransport pair leaves a fresh pair fully operational."""
+    c1, s1 = InMemoryTransport.create_pair()
+    c1.close()
+    s1.close()
+
+    c2, s2 = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(
+      id=1, method="tools/list",
+      params={"_meta": {**_FULL_META}},
+    )
+    c2.send(req)
+    received = s2.receive()
+    assert received.id == 1  # new pair unaffected by old pair's closed state

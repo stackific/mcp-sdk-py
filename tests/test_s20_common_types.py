@@ -19,10 +19,14 @@ from mcp_sdk_py.common_types import (
   IconTheme,
   Implementation,
   _SafeIconRedirectHandler,
+  assert_icon_domain_allowed,
   detect_image_mime_type,
   fetch_icon,
+  is_same_or_trusted_domain,
   is_valid_size_entry,
   resolve_tool_display_name,
+  sanitize_svg,
+  svg_contains_active_content,
   validate_icon_data,
   validate_icon_src,
 )
@@ -320,11 +324,92 @@ class TestIconDomainCheck:
     import urllib.request as _ur
     handler = _SafeIconRedirectHandler("https://example.com/icon.png")
     orig_req = _ur.Request("https://example.com/icon.png")
-    # No IconFetchError expected for same-origin redirect
     new_req = handler.redirect_request(
       orig_req, MagicMock(), 302, "Found", {}, "https://example.com/icon-v2.png"
     )
     assert new_req is not None
+
+  # -----------------------------------------------------------------------
+  # is_same_or_trusted_domain  (RC-1, R-14.2-e)
+  # -----------------------------------------------------------------------
+
+  def test_same_domain_is_trusted(self):
+    """Icon served from the same host as the peer is accepted."""
+    assert is_same_or_trusted_domain(
+      "https://example.com/icon.png", "example.com"
+    )
+
+  def test_different_domain_is_not_trusted(self):
+    """Icon served from a different host is rejected without explicit trust."""
+    assert not is_same_or_trusted_domain(
+      "https://cdn.example.net/icon.png", "example.com"
+    )
+
+  def test_data_uri_has_no_remote_host_always_trusted(self):
+    """A data: URI carries its bytes inline; no network host comparison applies."""
+    assert is_same_or_trusted_domain(
+      "data:image/png;base64,abc=", "example.com"
+    )
+
+  def test_explicitly_trusted_host_accepted(self):
+    """Icon served from a host in trusted_hosts is accepted."""
+    assert is_same_or_trusted_domain(
+      "https://icons.example.org/logo.svg",
+      "example.com",
+      trusted_hosts=frozenset({"icons.example.org"}),
+    )
+
+  def test_untrusted_host_not_in_trusted_set_rejected(self):
+    """A different host not in trusted_hosts is still rejected."""
+    assert not is_same_or_trusted_domain(
+      "https://attacker.io/evil.png",
+      "example.com",
+      trusted_hosts=frozenset({"icons.example.org"}),
+    )
+
+  def test_empty_trusted_hosts_by_default(self):
+    """Default trusted_hosts is empty — only same-domain is accepted."""
+    assert not is_same_or_trusted_domain(
+      "https://other.example.com/icon.png", "example.com"
+    )
+
+  # -----------------------------------------------------------------------
+  # assert_icon_domain_allowed  (RC-1, R-14.2-e)
+  # -----------------------------------------------------------------------
+
+  def test_assert_same_domain_does_not_raise(self):
+    """No exception raised when icon domain matches peer domain."""
+    assert_icon_domain_allowed(
+      "https://example.com/icon.png", "example.com"
+    )  # must not raise
+
+  def test_assert_cross_domain_raises_icon_fetch_error(self):
+    """Off-domain icon raises IconFetchError."""
+    with pytest.raises(IconFetchError):
+      assert_icon_domain_allowed(
+        "https://attacker.io/evil.png", "example.com"
+      )
+
+  def test_assert_error_message_names_host(self):
+    """Error message includes the offending host for diagnosability."""
+    with pytest.raises(IconFetchError, match="attacker.io"):
+      assert_icon_domain_allowed(
+        "https://attacker.io/evil.png", "example.com"
+      )
+
+  def test_assert_trusted_host_does_not_raise(self):
+    """Explicitly trusted host is accepted by the asserting variant too."""
+    assert_icon_domain_allowed(
+      "https://icons.example.org/logo.svg",
+      "example.com",
+      trusted_hosts=frozenset({"icons.example.org"}),
+    )  # must not raise
+
+  def test_assert_data_uri_does_not_raise(self):
+    """data: URIs have no remote host and are always accepted."""
+    assert_icon_domain_allowed(
+      "data:image/png;base64,abc=", "example.com"
+    )  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +432,86 @@ class TestSVGPrecautions:
     bom = b'\xef\xbb\xbf'
     svg_bytes = bom + b'<?xml version="1.0"?><svg/>'
     assert detect_image_mime_type(svg_bytes) == "image/svg+xml"
+
+  # -----------------------------------------------------------------------
+  # svg_contains_active_content  (RC-2, R-14.2-f)
+  # -----------------------------------------------------------------------
+
+  def test_clean_svg_returns_false(self):
+    """An SVG with no executable content is not flagged."""
+    clean = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>'
+    assert not svg_contains_active_content(clean)
+
+  def test_script_element_returns_true(self):
+    """An SVG containing a <script> element is flagged."""
+    dangerous = b'<svg><script>alert(1)</script></svg>'
+    assert svg_contains_active_content(dangerous)
+
+  def test_on_event_handler_attr_returns_true(self):
+    """on* event-handler attributes are flagged."""
+    dangerous = b'<svg><rect onclick="evil()"/></svg>'
+    assert svg_contains_active_content(dangerous)
+
+  def test_javascript_uri_returns_true(self):
+    """javascript: URIs embedded in SVG attributes are flagged."""
+    dangerous = b'<svg><a href="javascript:void(0)"/></svg>'
+    assert svg_contains_active_content(dangerous)
+
+  def test_foreign_object_returns_true(self):
+    """<foreignObject> can embed HTML and is flagged."""
+    dangerous = b'<svg><foreignObject><div/></foreignObject></svg>'
+    assert svg_contains_active_content(dangerous)
+
+  def test_iframe_returns_true(self):
+    """<iframe> embedded in SVG is flagged."""
+    dangerous = b'<svg><iframe src="evil.html"/></svg>'
+    assert svg_contains_active_content(dangerous)
+
+  # -----------------------------------------------------------------------
+  # sanitize_svg  (RC-2, R-14.2-f)
+  # -----------------------------------------------------------------------
+
+  def test_sanitize_removes_script_element(self):
+    """<script>…</script> is stripped from the SVG bytes."""
+    svg = b'<svg><script>alert(1)</script><rect/></svg>'
+    result = sanitize_svg(svg)
+    assert b"script" not in result.lower()
+    assert b"<rect/>" in result
+
+  def test_sanitize_removes_self_closing_script(self):
+    """Self-closing <script/> is also stripped."""
+    svg = b'<svg><script src="evil.js"/></svg>'
+    result = sanitize_svg(svg)
+    assert b"script" not in result.lower()
+
+  def test_sanitize_removes_on_event_handler(self):
+    """on* event-handler attributes are stripped."""
+    svg = b'<svg><rect onclick="evil()" width="10"/></svg>'
+    result = sanitize_svg(svg)
+    assert b"onclick" not in result
+
+  def test_sanitize_removes_javascript_uri(self):
+    """javascript: scheme is removed from attribute values."""
+    svg = b'<svg><a href="javascript:alert(1)">x</a></svg>'
+    result = sanitize_svg(svg)
+    assert b"javascript:" not in result.lower()
+
+  def test_sanitize_removes_foreign_object(self):
+    """<foreignObject> elements are stripped."""
+    svg = b'<svg><foreignObject><div/></foreignObject></svg>'
+    result = sanitize_svg(svg)
+    assert b"foreignObject" not in result
+
+  def test_sanitize_removes_iframe(self):
+    """<iframe> elements are stripped."""
+    svg = b'<svg><iframe src="evil.html"/></svg>'
+    result = sanitize_svg(svg)
+    assert b"iframe" not in result.lower()
+
+  def test_sanitize_result_is_clean(self):
+    """After sanitize_svg, svg_contains_active_content returns False."""
+    svg = b'<svg><script>alert(1)</script><rect onclick="x"/></svg>'
+    assert not svg_contains_active_content(sanitize_svg(svg))
 
 
 # ---------------------------------------------------------------------------

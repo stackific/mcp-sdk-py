@@ -242,6 +242,121 @@ def fetch_icon(src: str, declared_mime_type: str | None = None) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# §14.2  Same-/trusted-domain icon check  [R-14.2-e]
+# ---------------------------------------------------------------------------
+
+def icon_src_origin(src: str) -> tuple[str, str] | None:
+  """Return ``(scheme, host)`` for an icon ``src``, or None for a ``data:`` URI.
+
+  A ``data:`` URI carries its bytes inline — no network origin — so domain
+  checks do not apply to it and None is returned.
+  """
+  parsed = urlparse(src)
+  if parsed.scheme.lower() == "data":
+    return None
+  return (parsed.scheme.lower(), parsed.hostname or "")
+
+
+def is_same_or_trusted_domain(
+  src: str,
+  peer_host: str,
+  *,
+  trusted_hosts: frozenset[str] = frozenset(),
+) -> bool:
+  """Return True if an icon ``src`` is same-domain as the peer or in ``trusted_hosts`` (R-14.2-e).
+
+  Consumers SHOULD ensure icon-serving URLs are from the same domain as the
+  peer (client or server) that advertised the icon, or from an explicitly
+  trusted domain.  A ``data:`` URI has no remote host and is always accepted.
+
+  Args:
+    src: the icon ``src`` — an ``https:`` URL or ``data:`` URI.
+    peer_host: the host of the peer that advertised the icon.
+    trusted_hosts: additional hosts the consumer's policy trusts.
+  """
+  origin = icon_src_origin(src)
+  if origin is None:
+    return True  # data: URI — no remote host to compare
+  host = origin[1]
+  return host == peer_host or host in trusted_hosts
+
+
+def assert_icon_domain_allowed(
+  src: str,
+  peer_host: str,
+  *,
+  trusted_hosts: frozenset[str] = frozenset(),
+) -> None:
+  """Raise if an icon's host is neither the peer's domain nor a trusted one (R-14.2-e).
+
+  The policy-enforcing variant of :func:`is_same_or_trusted_domain`.
+
+  Raises:
+    IconFetchError: ``src`` host is neither ``peer_host`` nor in ``trusted_hosts``.
+  """
+  if not is_same_or_trusted_domain(src, peer_host, trusted_hosts=trusted_hosts):
+    host = (icon_src_origin(src) or ("", ""))[1]
+    raise IconFetchError(
+      f"Icon host {host!r} is neither the peer domain {peer_host!r} nor a "
+      f"trusted domain; declining per same-/trusted-domain policy (R-14.2-e)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# §14.2  SVG precautions against embedded script  [R-14.2-f]
+# ---------------------------------------------------------------------------
+
+#: Element names that can execute script or pull in external/active content.
+_SVG_DANGEROUS_ELEMENTS: tuple[bytes, ...] = (b"script", b"foreignObject", b"iframe")
+_SVG_ACTIVE_HINTS_RE = re.compile(
+  rb"<\s*(script|foreignObject|iframe)\b|javascript:|\son[a-zA-Z]+\s*=",
+  re.IGNORECASE,
+)
+_SVG_EVENT_HANDLER_RE = re.compile(
+  rb"\son[a-zA-Z]+\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.IGNORECASE
+)
+_SVG_JS_URI_RE = re.compile(rb"javascript:", re.IGNORECASE)
+
+
+def _strip_svg_element(data: bytes, name: bytes) -> bytes:
+  """Remove every ``<name>…</name>`` and self-closing ``<name/>`` occurrence."""
+  paired = re.compile(
+    rb"<\s*" + name + rb"\b[^>]*>.*?<\s*/\s*" + name + rb"\s*>",
+    re.IGNORECASE | re.DOTALL,
+  )
+  self_close = re.compile(rb"<\s*" + name + rb"\b[^>]*/\s*>", re.IGNORECASE)
+  return self_close.sub(b"", paired.sub(b"", data))
+
+
+def svg_contains_active_content(data: bytes) -> bool:
+  """Return True if an SVG payload may execute script (R-14.2-f).
+
+  Flags ``<script>`` elements, ``on*=`` event-handler attributes, ``javascript:``
+  URIs, and elements that can embed external/active content (``foreignObject``,
+  ``iframe``).  A consumer SHOULD sanitize such SVG with :func:`sanitize_svg`
+  or decline to render it.
+  """
+  return bool(_SVG_ACTIVE_HINTS_RE.search(data))
+
+
+def sanitize_svg(data: bytes) -> bytes:
+  """Strip executable content from an SVG so it is safer to render (R-14.2-f).
+
+  Removes ``<script>``, ``<foreignObject>``, and ``<iframe>`` elements, ``on*=``
+  event-handler attributes, and ``javascript:`` URI occurrences.  After
+  sanitizing, :func:`svg_contains_active_content` returns False for the result.
+  A consumer with stricter policy MAY instead decline any SVG for which
+  :func:`svg_contains_active_content` returns True.
+  """
+  cleaned = data
+  for element in _SVG_DANGEROUS_ELEMENTS:
+    cleaned = _strip_svg_element(cleaned, element)
+  cleaned = _SVG_EVENT_HANDLER_RE.sub(b" ", cleaned)
+  cleaned = _SVG_JS_URI_RE.sub(b"", cleaned)
+  return cleaned
+
+
+# ---------------------------------------------------------------------------
 # §14.2  IconTheme enum  [R-14.2-j]
 # ---------------------------------------------------------------------------
 

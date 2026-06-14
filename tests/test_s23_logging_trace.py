@@ -1,6 +1,6 @@
 """Tests for S23 — Deprecated Logging & Trace Context Propagation.
 
-Coverage map (19 ACs):
+Coverage map (20 ACs):
   AC-23.1  → TestLoggingDeprecationMarkers
   AC-23.2  → TestLoggingLevelSet
   AC-23.3  → TestValidateKnownLoggingLevel
@@ -20,6 +20,7 @@ Coverage map (19 ACs):
   AC-23.17 → TestLoggingMethodName
   AC-23.18 → TestLoggingLevelOrdering
   AC-23.19 → TestLoggingDataAny
+  AC-23.20 → TestRedactLogData
 """
 
 import pytest
@@ -34,6 +35,7 @@ from mcp_sdk_py.logging_utils import (
   compare_logging_levels,
   extract_trace_context,
   propagate_trace_context,
+  redact_log_data,
   should_emit_log_notification,
   validate_known_logging_level,
   validate_logging_message_notification_params,
@@ -472,3 +474,124 @@ class TestLoggingDataAny:
     payload = {"key": {"nested": True}}
     p = validate_logging_message_notification_params({"level": "debug", "data": payload})
     assert p.data == payload
+
+
+# ---------------------------------------------------------------------------
+# AC-23.20 — redact_log_data: safety net against secret leakage  (S23 Bucket B)
+# ---------------------------------------------------------------------------
+
+class TestRedactLogData:
+  """AC-23.20: redact_log_data removes sensitive key values from log payloads."""
+
+  # -----------------------------------------------------------------------
+  # Scalar and non-dict passthrough
+  # -----------------------------------------------------------------------
+
+  def test_string_passthrough(self):
+    """Non-dict scalars are returned unchanged."""
+    assert redact_log_data("plain text") == "plain text"
+
+  def test_integer_passthrough(self):
+    assert redact_log_data(42) == 42
+
+  def test_none_passthrough(self):
+    assert redact_log_data(None) is None
+
+  def test_empty_dict_unchanged(self):
+    assert redact_log_data({}) == {}
+
+  # -----------------------------------------------------------------------
+  # Sensitive key redaction
+  # -----------------------------------------------------------------------
+
+  def test_password_key_redacted(self):
+    assert redact_log_data({"password": "s3cr3t"}) == {"password": "[REDACTED]"}
+
+  def test_token_key_redacted(self):
+    assert redact_log_data({"token": "abc123"}) == {"token": "[REDACTED]"}
+
+  def test_api_key_redacted(self):
+    assert redact_log_data({"api_key": "sk-xyz"}) == {"api_key": "[REDACTED]"}
+
+  def test_secret_key_redacted(self):
+    assert redact_log_data({"secret": "shh"}) == {"secret": "[REDACTED]"}
+
+  def test_authorization_key_redacted(self):
+    result = redact_log_data({"authorization": "Bearer tok"})
+    assert result == {"authorization": "[REDACTED]"}
+
+  # -----------------------------------------------------------------------
+  # Non-sensitive keys preserved
+  # -----------------------------------------------------------------------
+
+  def test_non_sensitive_key_preserved(self):
+    result = redact_log_data({"message": "hello", "level": "info"})
+    assert result == {"message": "hello", "level": "info"}
+
+  def test_mixed_dict_redacts_only_sensitive(self):
+    data = {"user": "alice", "password": "hunter2", "action": "login"}
+    result = redact_log_data(data)
+    assert result["user"] == "alice"
+    assert result["action"] == "login"
+    assert result["password"] == "[REDACTED]"
+
+  # -----------------------------------------------------------------------
+  # Case-insensitive key matching
+  # -----------------------------------------------------------------------
+
+  def test_uppercase_key_redacted(self):
+    assert redact_log_data({"PASSWORD": "x"}) == {"PASSWORD": "[REDACTED]"}
+
+  def test_mixed_case_key_redacted(self):
+    assert redact_log_data({"Token": "x"}) == {"Token": "[REDACTED]"}
+
+  # -----------------------------------------------------------------------
+  # Nested structures
+  # -----------------------------------------------------------------------
+
+  def test_nested_dict_sensitive_key_redacted(self):
+    data = {"user": {"password": "secret", "name": "alice"}}
+    result = redact_log_data(data)
+    assert result["user"]["password"] == "[REDACTED]"
+    assert result["user"]["name"] == "alice"
+
+  def test_list_of_dicts_redacted(self):
+    data = [{"password": "x"}, {"name": "bob"}]
+    result = redact_log_data(data)
+    assert result[0]["password"] == "[REDACTED]"
+    assert result[1]["name"] == "bob"
+
+  def test_list_of_scalars_passthrough(self):
+    data = [1, 2, 3]
+    assert redact_log_data(data) == [1, 2, 3]
+
+  def test_deeply_nested_redacted(self):
+    data = {"a": {"b": {"c": {"password": "deep"}}}}
+    result = redact_log_data(data)
+    assert result["a"]["b"]["c"]["password"] == "[REDACTED]"
+
+  # -----------------------------------------------------------------------
+  # Custom sensitive_keys override
+  # -----------------------------------------------------------------------
+
+  def test_custom_sensitive_keys_used(self):
+    data = {"ssn": "123-45-6789", "name": "alice"}
+    result = redact_log_data(data, sensitive_keys=frozenset({"ssn"}))
+    assert result["ssn"] == "[REDACTED]"
+    assert result["name"] == "alice"
+
+  def test_custom_keys_override_defaults(self):
+    """When custom set is provided, default keys are not automatically included."""
+    data = {"password": "pw", "custom_secret": "val"}
+    result = redact_log_data(data, sensitive_keys=frozenset({"custom_secret"}))
+    assert result["custom_secret"] == "[REDACTED]"
+    assert result["password"] == "pw"  # not in custom set
+
+  # -----------------------------------------------------------------------
+  # Original dict is not mutated
+  # -----------------------------------------------------------------------
+
+  def test_original_dict_not_mutated(self):
+    original = {"password": "pw", "name": "alice"}
+    _ = redact_log_data(original)
+    assert original["password"] == "pw"  # untouched

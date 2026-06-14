@@ -109,6 +109,8 @@ class DiscoverResult:
     capabilities: server capability map; empty dict ``{}`` is valid (R-5.3.2-e).
     server_info: server identity — REQUIRES ``name`` and ``version`` strings (R-5.3.2-f).
     instructions: optional natural-language guidance for effective server use (R-5.3.2-g/h/i).
+      Authorship is entirely the server application's responsibility — the SDK
+      carries the value verbatim and never generates or modifies it.
     meta: optional result-level metadata object (R-5.3.2-k).
   """
 
