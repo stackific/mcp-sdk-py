@@ -250,6 +250,123 @@ W3C_TRACE_KEYS: frozenset[str] = frozenset({
   "baggage",
 })
 
+# W3C Trace Context Level 1 traceparent format (https://www.w3.org/TR/trace-context/)
+#   version "-" trace-id "-" parent-id "-" trace-flags
+#   All fields are lowercase hexadecimal; version must not be "ff" (reserved).
+_TRACEPARENT_RE = re.compile(
+  r'^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+)
+_TRACE_ID_ALL_ZEROS: str = '0' * 32
+_PARENT_ID_ALL_ZEROS: str = '0' * 16
+
+
+def validate_w3c_traceparent(value: str) -> None:
+  """Validate a traceparent value against W3C Trace Context Level 1 (R-2.6.2-i).
+
+  Format: version-traceId-parentId-flags (4 lowercase-hex fields, dash-separated).
+  Rejects: wrong number of fields, non-hex chars, version 'ff', all-zero trace-id
+  or parent-id.
+  """
+  if not _TRACEPARENT_RE.match(value):
+    raise ValueError(
+      f"traceparent value {value!r} does not match the W3C Trace Context format "
+      f"'version-traceId-parentId-flags' (all lowercase hex) (R-2.6.2-i)"
+    )
+  parts = value.split('-', 3)
+  version, trace_id, parent_id = parts[0], parts[1], parts[2]
+  if version == 'ff':
+    raise ValueError(
+      f"traceparent version 'ff' is reserved and MUST NOT be used (R-2.6.2-i)"
+    )
+  if trace_id == _TRACE_ID_ALL_ZEROS:
+    raise ValueError(
+      f"traceparent trace-id MUST NOT be all zeros (R-2.6.2-i)"
+    )
+  if parent_id == _PARENT_ID_ALL_ZEROS:
+    raise ValueError(
+      f"traceparent parent-id MUST NOT be all zeros (R-2.6.2-i)"
+    )
+
+
+def validate_w3c_tracestate(value: str) -> None:
+  """Validate a tracestate value against W3C Trace Context format (R-2.6.2-i).
+
+  Each comma-separated list-member must be a 'key=value' pair with non-empty
+  key and value.
+  """
+  if not value or not value.strip():
+    raise ValueError("tracestate must not be empty (R-2.6.2-i)")
+  members = [m.strip() for m in value.split(',')]
+  members = [m for m in members if m]
+  if not members:
+    raise ValueError(
+      "tracestate must contain at least one list-member (R-2.6.2-i)"
+    )
+  for member in members:
+    if '=' not in member:
+      raise ValueError(
+        f"tracestate list-member {member!r} must be 'key=value' form (R-2.6.2-i)"
+      )
+    key, val = member.split('=', 1)
+    if not key:
+      raise ValueError(
+        f"tracestate list-member key must not be empty (R-2.6.2-i)"
+      )
+    if not val:
+      raise ValueError(
+        f"tracestate list-member value for key {key!r} must not be empty (R-2.6.2-i)"
+      )
+
+
+def validate_w3c_baggage(value: str) -> None:
+  """Validate a baggage value against W3C Baggage format (R-2.6.2-i).
+
+  Each comma-separated list-member must be a 'name=value' pair (with optional
+  ';property' suffixes) with non-empty name and value.
+  """
+  if not value or not value.strip():
+    raise ValueError("baggage must not be empty (R-2.6.2-i)")
+  members = [m.strip() for m in value.split(',')]
+  members = [m for m in members if m]
+  if not members:
+    raise ValueError(
+      "baggage must contain at least one list-member (R-2.6.2-i)"
+    )
+  for member in members:
+    name_value_part = member.split(';')[0].strip()
+    if '=' not in name_value_part:
+      raise ValueError(
+        f"baggage list-member {member!r} must be 'name=value' form (R-2.6.2-i)"
+      )
+    name, val = name_value_part.split('=', 1)
+    if not name.strip():
+      raise ValueError(
+        f"baggage list-member name must not be empty (R-2.6.2-i)"
+      )
+    if not val:
+      raise ValueError(
+        f"baggage list-member value for name {name!r} must not be empty (R-2.6.2-i)"
+      )
+
+
+def validate_w3c_trace_value(key: str, value: str) -> None:
+  """Validate the value of a W3C trace-context bare _meta key (R-2.6.2-i).
+
+  Dispatches to the format-specific validator for traceparent, tracestate,
+  or baggage.  Raises ValueError for an unrecognized key name.
+  """
+  if key == "traceparent":
+    validate_w3c_traceparent(value)
+  elif key == "tracestate":
+    validate_w3c_tracestate(value)
+  elif key == "baggage":
+    validate_w3c_baggage(value)
+  else:
+    raise ValueError(
+      f"{key!r} is not a W3C trace-context bare key "
+      f"(expected one of {sorted(W3C_TRACE_KEYS)}) (R-2.6.2-i)"
+    )
+
 
 def is_valid_meta_label(label: str) -> bool:
   """Return True if label is a valid prefix label (R-2.6.2-c)."""

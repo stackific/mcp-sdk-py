@@ -10,8 +10,11 @@ Spec: §14.1-§14.3
 
 from __future__ import annotations
 
+import base64
 import enum
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -80,6 +83,162 @@ def validate_icon_src(src: str) -> None:
 def is_valid_size_entry(entry: str) -> bool:
   """Return True for a valid size specifier: 'any' or 'WxH' (R-14.2-h)."""
   return entry == "any" or bool(_SIZE_SPEC_RE.match(entry))
+
+
+# ---------------------------------------------------------------------------
+# §14.1  Display-name resolution  [R-14.1-c, R-14.1-d, R-14.1-e]
+# ---------------------------------------------------------------------------
+
+def resolve_tool_display_name(
+  name: str,
+  title: str | None = None,
+  annotations_title: str | None = None,
+) -> str:
+  """Resolve the display name for a tool using the §14.1 / §16 precedence.
+
+  Precedence order (R-14.1-c, R-14.1-d, R-14.1-e):
+    1. title            — MUST be preferred when present (R-14.1-c)
+    2. annotations.title — tool-specific fallback from §16 (R-14.1-e)
+    3. name             — MUST be used when both are absent (R-14.1-d)
+  """
+  if title is not None:
+    return title
+  if annotations_title is not None:
+    return annotations_title
+  return name
+
+
+# ---------------------------------------------------------------------------
+# §14.2  Icon security: fetch and content-type validation
+#        [R-14.2-p, R-14.2-q, R-14.2-r, R-14.2-s, R-14.2-t, R-14.2-u]
+# ---------------------------------------------------------------------------
+
+class IconFetchError(ValueError):
+  """Raised when icon fetching or validation fails a security check (§14.2)."""
+
+
+def detect_image_mime_type(data: bytes) -> str | None:
+  """Detect an image MIME type from the file's magic bytes (R-14.2-s).
+
+  Returns the MIME type string for recognized image formats, or None when the
+  content is not a recognized image format.  The declared mimeType field is
+  explicitly NOT consulted here — the caller must treat it as advisory only.
+  """
+  if len(data) >= 8 and data[:8] == b'\x89PNG\r\n\x1a\n':
+    return "image/png"
+  if len(data) >= 3 and data[:3] == b'\xff\xd8\xff':
+    return "image/jpeg"
+  if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+    return "image/webp"
+  # SVG: UTF-8 XML; strip BOM (EF BB BF) and leading whitespace
+  head = data[:512].lstrip(b'\xef\xbb\xbf \t\r\n')
+  if head.startswith((b'<?xml', b'<svg', b'<SVG')):
+    return "image/svg+xml"
+  return None
+
+
+def validate_icon_data(data: bytes, declared_mime_type: str | None = None) -> str:
+  """Validate icon content and return the detected MIME type (R-14.2-r–u).
+
+  Applies the strict allowlist (R-14.2-u), detects content type from magic
+  bytes (R-14.2-s), and rejects mismatches between the detected and declared
+  types (R-14.2-t).
+
+  Raises IconFetchError for unrecognized format, type outside allowlist, or
+  declared-vs-detected mismatch.
+  """
+  detected = detect_image_mime_type(data)
+  if detected is None:
+    raise IconFetchError(
+      "Icon content is not a recognized image format; "
+      "content type could not be determined from magic bytes (R-14.2-t, R-14.2-u)"
+    )
+  if detected not in SUPPORTED_MIME_TYPES:
+    raise IconFetchError(
+      f"Detected image type {detected!r} is not in the strict allowlist "
+      f"{sorted(SUPPORTED_MIME_TYPES)} (R-14.2-u)"
+    )
+  if declared_mime_type is not None:
+    # Normalize image/jpg → image/jpeg for the equality check
+    norm_decl = "image/jpeg" if declared_mime_type == "image/jpg" else declared_mime_type
+    norm_det = "image/jpeg" if detected == "image/jpg" else detected
+    if norm_decl != norm_det:
+      raise IconFetchError(
+        f"MIME type mismatch: declared {declared_mime_type!r} but "
+        f"magic bytes indicate {detected!r} (R-14.2-t)"
+      )
+  return detected
+
+
+def _parse_data_uri(src: str) -> tuple[str | None, bytes]:
+  """Extract (mime_type_or_None, raw_bytes) from a data: URI."""
+  rest = src[5:]  # strip "data:"
+  if ',' not in rest:
+    raise IconFetchError("Malformed data: URI (missing comma) (R-14.2-d)")
+  header, encoded = rest.split(',', 1)
+  is_base64 = header.endswith(';base64')
+  mime_part = header[:-7] if is_base64 else header
+  mime_type = mime_part.strip() or None
+  if is_base64:
+    try:
+      raw = base64.b64decode(encoded)
+    except Exception as exc:
+      raise IconFetchError(
+        f"data: URI base64 payload could not be decoded: {exc}"
+      ) from exc
+  else:
+    raw = encoded.encode("latin-1")
+  return mime_type, raw
+
+
+class _SafeIconRedirectHandler(urllib.request.HTTPRedirectHandler):
+  """Redirect handler that blocks cross-origin and scheme-change redirects (R-14.2-p)."""
+
+  def __init__(self, original_url: str) -> None:
+    super().__init__()
+    self._original = urlparse(original_url)
+
+  def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+    dest = urlparse(newurl)
+    if dest.netloc != self._original.netloc or dest.scheme != self._original.scheme:
+      raise IconFetchError(
+        f"Cross-origin or scheme-change redirect blocked: "
+        f"{req.full_url!r} → {newurl!r} (R-14.2-p)"
+      )
+    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_icon(src: str, declared_mime_type: str | None = None) -> bytes:
+  """Fetch and validate an icon enforcing all §14.2 security constraints.
+
+  For data: URIs, decodes the base64 payload locally with no network I/O.
+  For https: URLs, issues a credential-free request (R-14.2-q) — no cookies,
+  Authorization header, or client credentials are sent — and does not follow
+  cross-origin redirects or scheme changes (R-14.2-p).  Validates the content
+  type via magic bytes (R-14.2-r, R-14.2-s, R-14.2-t, R-14.2-u).
+  """
+  validate_icon_src(src)  # scheme allow/deny (R-14.2-n, R-14.2-o)
+
+  if src.startswith("data:"):
+    mime_from_uri, raw = _parse_data_uri(src)
+    validate_icon_data(raw, declared_mime_type or mime_from_uri)
+    return raw
+
+  # https: URL — credential-free fetch; build_opener without HTTPCookieProcessor
+  # or auth handlers means no cookies or credentials are sent (R-14.2-q).
+  req = urllib.request.Request(src)
+  opener = urllib.request.build_opener(_SafeIconRedirectHandler(src))
+
+  try:
+    with opener.open(req, timeout=10) as resp:
+      raw = resp.read()
+  except IconFetchError:
+    raise
+  except urllib.error.URLError as exc:
+    raise IconFetchError(f"Failed to fetch icon {src!r}: {exc}") from exc
+
+  validate_icon_data(raw, declared_mime_type)
+  return raw
 
 
 # ---------------------------------------------------------------------------

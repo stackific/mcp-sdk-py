@@ -398,11 +398,37 @@ class TestNativeDeprecationMarking:
 # ---------------------------------------------------------------------------
 
 class TestDeprecationMarkingReferences:
-  """AC-43.24: Deprecation marking SHOULD reference migration path and earliest removal."""
+  """AC-43.24: Deprecation marking SHOULD reference migration path and earliest removal (R-27.4-b)."""
 
-  def test_warn_deprecated_feature_includes_feature_name(self):
+  def test_deprecated_feature_decorator_includes_earliest_removal_in_warning(self):
+    """When earliest_removal is supplied, it MUST appear in the emitted warning (R-27.4-b)."""
+    @deprecated_feature("use new_api instead", earliest_removal="2026-07-28")
+    def old_api() -> None:
+      pass
+
+    with pytest.warns(DeprecationWarning) as record:
+      old_api()
+
+    message = str(record[0].message)
+    assert "new_api" in message or "use new_api" in message
+    assert "2026-07-28" in message
+
+  def test_warn_deprecated_feature_includes_earliest_removal(self):
+    """warn_deprecated_feature with earliest_removal includes it in the message (R-27.4-b)."""
+    with warnings.catch_warnings(record=True) as caught:
+      warnings.simplefilter("always")
+      warn_deprecated_feature(
+        "old-feature", "use new-feature", earliest_removal="2026-07-28"
+      )
+    assert len(caught) == 1
+    message = str(caught[0].message)
+    assert "old-feature" in message
+    assert "2026-07-28" in message
+
+  def test_warn_deprecated_feature_without_earliest_removal(self):
+    """Without earliest_removal, warn_deprecated_feature still emits the warning."""
     with pytest.warns(DeprecationWarning, match="old-feature"):
-      warn_deprecated_feature("old-feature", "use new-feature (earliest removal: 2026-07-28)")
+      warn_deprecated_feature("old-feature", "use new-feature")
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +437,36 @@ class TestDeprecationMarkingReferences:
 # ---------------------------------------------------------------------------
 
 class TestDocumentationMarking:
-  """AC-43.25: Deprecated features should be marked in documentation with migration path."""
+  """AC-43.25: Deprecated features SHOULD be marked in published documentation (R-27.4-c)."""
 
-  def test_registry_entries_serve_as_documentation(self):
-    for entry in DEPRECATED_FEATURES_REGISTRY:
-      assert entry.migration_note, f"No migration note for {entry.feature!r}"
+  def test_deprecated_feature_decorator_updates_docstring(self):
+    """@deprecated_feature must inject a deprecation notice into __doc__ (R-27.4-c)."""
+    @deprecated_feature("use new_func instead", earliest_removal="2027-01-01")
+    def legacy_func() -> None:
+      """Do the old thing."""
+
+    assert legacy_func.__doc__ is not None
+    assert "deprecated" in legacy_func.__doc__.lower()
+    assert "new_func" in legacy_func.__doc__
+
+  def test_deprecated_feature_decorator_docstring_includes_removal_date(self):
+    @deprecated_feature("use replacement", earliest_removal="2026-07-28")
+    def another_old_func() -> None:
+      pass
+
+    assert "2026-07-28" in (another_old_func.__doc__ or "")
+
+  def test_registry_migration_notes_match_spec_authoritative_text(self):
+    """Registry entries must use the §27.3 authoritative migration note text."""
+    entry_map = {e.feature: e for e in DEPRECATED_FEATURES_REGISTRY}
+    # Logging capability — spec: "standard error stream", "external observability framework"
+    logging_entry = entry_map["Logging capability"]
+    assert "standard error" in logging_entry.migration_note.lower() or \
+           "stderr" in logging_entry.migration_note
+    assert "observability" in logging_entry.migration_note.lower()
+    # includeContext — spec: defined_in should be §21 (not §20 / §21)
+    ctx_entry = entry_map["includeContext values 'thisServer' and 'allServers'"]
+    assert ctx_entry.defined_in == "§21"
 
 
 # ---------------------------------------------------------------------------

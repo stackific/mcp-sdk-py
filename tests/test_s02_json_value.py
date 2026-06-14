@@ -40,6 +40,10 @@ from mcp_sdk_py.json_value import (
   validate_meta_key_grammar,
   validate_meta_key_not_reserved,
   validate_safe_integer,
+  validate_w3c_baggage,
+  validate_w3c_trace_value,
+  validate_w3c_traceparent,
+  validate_w3c_tracestate,
 )
 from mcp_sdk_py.foundations import ConformanceError
 
@@ -624,14 +628,125 @@ class TestMetaTraceAndUnknownKeys:
   def test_unknown_meta_keys_are_ignored_via_strip(self):
     """Receivers MUST ignore _meta keys they do not recognize (R-2.6.2-j)."""
     meta = {
-      "traceparent": "00-abc-def-01",
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
       "com.example/tenant": "acme",
       "unknown-future-key": "value",
     }
     known = frozenset({"traceparent", "com.example/tenant"})
     result = strip_unknown_keys(meta, known)
     assert "unknown-future-key" not in result
-    assert result["traceparent"] == "00-abc-def-01"
+    assert "traceparent" in result
+
+
+# ---------------------------------------------------------------------------
+# AC-02.19  W3C trace-context value validation  [R-2.6.2-i]
+# ---------------------------------------------------------------------------
+
+class TestW3CTraceValueValidation:
+  """AC-02.19 (R-2.6.2-i): traceparent/tracestate/baggage values MUST conform
+  to their respective W3C formats.
+  """
+
+  # --- traceparent ---
+
+  def test_valid_traceparent_passes(self):
+    """The spec wire example (§2.6.2) must pass."""
+    validate_w3c_traceparent(
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    )  # no exception
+
+  def test_invalid_traceparent_rejected(self):
+    """'not-a-valid-traceparent' must be rejected (TV-02.21 negative vector)."""
+    with pytest.raises(ValueError, match="traceparent"):
+      validate_w3c_traceparent("not-a-valid-traceparent")
+
+  def test_traceparent_wrong_field_count_rejected(self):
+    with pytest.raises(ValueError):
+      validate_w3c_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7")
+
+  def test_traceparent_version_ff_rejected(self):
+    """Version 'ff' is reserved and MUST NOT be used."""
+    with pytest.raises(ValueError, match="ff"):
+      validate_w3c_traceparent(
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      )
+
+  def test_traceparent_all_zero_trace_id_rejected(self):
+    with pytest.raises(ValueError, match="all zeros"):
+      validate_w3c_traceparent(
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01"
+      )
+
+  def test_traceparent_all_zero_parent_id_rejected(self):
+    with pytest.raises(ValueError, match="all zeros"):
+      validate_w3c_traceparent(
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"
+      )
+
+  def test_traceparent_uppercase_rejected(self):
+    """Format requires lowercase hex."""
+    with pytest.raises(ValueError):
+      validate_w3c_traceparent(
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01"
+      )
+
+  # --- tracestate ---
+
+  def test_valid_tracestate_passes(self):
+    validate_w3c_tracestate("vendorname1=opaqueValue1,vendorname2=opaqueValue2")
+
+  def test_single_member_tracestate_passes(self):
+    validate_w3c_tracestate("rojo=00f067aa0ba902b7")
+
+  def test_empty_tracestate_rejected(self):
+    with pytest.raises(ValueError, match="empty"):
+      validate_w3c_tracestate("")
+
+  def test_tracestate_missing_equals_rejected(self):
+    with pytest.raises(ValueError, match="key=value"):
+      validate_w3c_tracestate("invalidmember")
+
+  def test_tracestate_empty_value_rejected(self):
+    with pytest.raises(ValueError, match="empty"):
+      validate_w3c_tracestate("key=")
+
+  # --- baggage ---
+
+  def test_valid_baggage_passes(self):
+    validate_w3c_baggage("userId=alice,serverNode=DF%2028")
+
+  def test_baggage_with_property_passes(self):
+    validate_w3c_baggage("userId=alice;metadata=x")
+
+  def test_empty_baggage_rejected(self):
+    with pytest.raises(ValueError, match="empty"):
+      validate_w3c_baggage("")
+
+  def test_baggage_missing_equals_rejected(self):
+    with pytest.raises(ValueError, match="name=value"):
+      validate_w3c_baggage("invalidmember")
+
+  # --- dispatch ---
+
+  def test_validate_w3c_trace_value_dispatches_traceparent(self):
+    validate_w3c_trace_value(
+      "traceparent",
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    )  # no exception
+
+  def test_validate_w3c_trace_value_dispatches_tracestate(self):
+    validate_w3c_trace_value("tracestate", "key=value")
+
+  def test_validate_w3c_trace_value_dispatches_baggage(self):
+    validate_w3c_trace_value("baggage", "key=value")
+
+  def test_validate_w3c_trace_value_rejects_unknown_key(self):
+    with pytest.raises(ValueError, match="not a W3C trace"):
+      validate_w3c_trace_value("custom-key", "some-value")
+
+  def test_validate_w3c_trace_value_rejects_invalid_traceparent_value(self):
+    with pytest.raises(ValueError):
+      validate_w3c_trace_value("traceparent", "not-a-valid-traceparent")
 
 
 # ---------------------------------------------------------------------------

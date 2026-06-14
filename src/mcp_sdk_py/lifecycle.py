@@ -164,8 +164,8 @@ DEPRECATED_FEATURES_REGISTRY: tuple[DeprecatedRegistryEntry, ...] = (
     feature="Roots capability",
     defined_in="§21",
     migration_note=(
-      "Roots is deprecated; use resource subscriptions or "
-      "explicit resource URIs supplied by the host."
+      "Convey directory or file locations through tool parameters, resource URIs, "
+      "or out-of-band server configuration rather than through the Roots capability."
     ),
     earliest_removal="2026-07-28",
   ),
@@ -173,17 +173,17 @@ DEPRECATED_FEATURES_REGISTRY: tuple[DeprecatedRegistryEntry, ...] = (
     feature="Sampling capability",
     defined_in="§21",
     migration_note=(
-      "Sampling is deprecated; use elicitation (§20) for "
-      "structured client-to-host input requests."
+      "Integrate directly with a language-model provider interface rather than "
+      "requesting model completions from the client through the protocol."
     ),
     earliest_removal="2026-07-28",
   ),
   DeprecatedRegistryEntry(
     feature="includeContext values 'thisServer' and 'allServers'",
-    defined_in="§20 / §21",
+    defined_in="§21",
     migration_note=(
-      "The 'thisServer' and 'allServers' includeContext values are deprecated; "
-      "omit includeContext or use 'none'."
+      "Omit the field or use the value 'none'. "
+      "The two named values are case-sensitive."
     ),
     earliest_removal="2026-07-28",
   ),
@@ -191,17 +191,18 @@ DEPRECATED_FEATURES_REGISTRY: tuple[DeprecatedRegistryEntry, ...] = (
     feature="Logging capability",
     defined_in="§15",
     migration_note=(
-      "For stdio (§8), write diagnostics to stderr; for general observability "
-      "emit telemetry via an external observability framework."
+      "For the stdio transport (§8), write diagnostic output to the standard "
+      "error stream; for general observability, emit telemetry through an "
+      "external observability framework."
     ),
     earliest_removal="2026-07-28",
   ),
   DeprecatedRegistryEntry(
-    feature="io.modelcontextprotocol/logLevel _meta key",
+    feature="io.modelcontextprotocol/logLevel metadata key",
     defined_in="§15",
     migration_note=(
-      "The io.modelcontextprotocol/logLevel _meta key is deprecated alongside "
-      "the Logging capability; use out-of-band log configuration instead."
+      "Follows the Logging capability; do not introduce this key for new "
+      "functionality. The key string is case-sensitive."
     ),
     earliest_removal="2026-07-28",
   ),
@@ -209,8 +210,8 @@ DEPRECATED_FEATURES_REGISTRY: tuple[DeprecatedRegistryEntry, ...] = (
     feature="Dynamic Client Registration",
     defined_in="§23",
     migration_note=(
-      "Dynamic Client Registration (OAuth 2.0 RFC 7591) is deprecated; "
-      "register clients statically with the authorization server."
+      "Use the client-identity registration mechanism described in §23 "
+      "Authorization in place of dynamic registration."
     ),
     earliest_removal="2026-07-28",
   ),
@@ -231,39 +232,62 @@ def is_deprecated_feature(feature_name: str) -> bool:
 # §27.4  Signaling deprecation  [R-27.4-a–i]
 # ---------------------------------------------------------------------------
 
-def warn_deprecated_feature(feature_name: str, migration_info: str) -> None:
+def warn_deprecated_feature(
+  feature_name: str,
+  migration_info: str,
+  *,
+  earliest_removal: str | None = None,
+) -> None:
   """Emit a runtime DeprecationWarning for feature_name (R-27.4-d).
 
-  The warning is emitted through Python's ``warnings`` module — it never
-  appears on the protocol wire and never alters the message format or
-  response semantics (R-27.4-e).
+  When earliest_removal is supplied, it is included in the warning message so
+  that the §27.3 migration path and §27.2 removal timing are both referenced
+  (R-27.4-b).  The warning is emitted out of band through Python's
+  ``warnings`` module and never alters the protocol wire or response semantics
+  (R-27.4-e).
   """
-  warnings.warn(
-    f"Deprecated MCP feature {feature_name!r}: {migration_info}",
-    DeprecationWarning,
-    stacklevel=2,
-  )
+  message = f"Deprecated MCP feature {feature_name!r}: {migration_info}"
+  if earliest_removal is not None:
+    message += f" (eligible for removal: {earliest_removal})"
+  warnings.warn(message, DeprecationWarning, stacklevel=2)
 
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
-def deprecated_feature(migration_info: str) -> Callable[[_F], _F]:
-  """Decorator: wrap a callable to emit a DeprecationWarning on every call (R-27.4-a, d).
+def deprecated_feature(
+  migration_info: str,
+  *,
+  earliest_removal: str | None = None,
+) -> Callable[[_F], _F]:
+  """Decorator: mark a Python API surface as deprecated (R-27.4-a).
 
-  Satisfies the native-language deprecation-marking requirement (R-27.4-a) for
-  Python API surfaces that expose a deprecated feature.  The decorated callable
-  remains fully functional (R-27.2-e, R-27.2-f).
+  Emits a DeprecationWarning on every call (R-27.4-d).  When earliest_removal
+  is provided, the warning references the §27.3 migration path and the §27.2
+  removal timing (R-27.4-b).  Updates the wrapped function's ``__doc__`` to
+  include a ``.. deprecated::`` notice so the marking appears in published
+  documentation (R-27.4-c).  The decorated callable remains fully functional
+  (R-27.2-e, R-27.2-f).
   """
   def decorator(func: _F) -> _F:
+    message = f"Deprecated MCP feature {func.__name__!r}: {migration_info}"
+    if earliest_removal is not None:
+      message += f" (eligible for removal: {earliest_removal})"
+
+    # Prepend a reStructuredText deprecation directive to the docstring (R-27.4-c)
+    removal_suffix = (
+      f" Eligible for removal: {earliest_removal}." if earliest_removal else ""
+    )
+    doc_notice = (
+      f"\n\n.. deprecated::\n   {migration_info}{removal_suffix}\n"
+    )
+
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-      warnings.warn(
-        f"Deprecated MCP feature {func.__name__!r}: {migration_info}",
-        DeprecationWarning,
-        stacklevel=2,
-      )
+      warnings.warn(message, DeprecationWarning, stacklevel=2)
       return func(*args, **kwargs)
+
+    wrapper.__doc__ = (func.__doc__ or "") + doc_notice
     return wrapper  # type: ignore[return-value]
   return decorator
 

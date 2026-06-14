@@ -3,6 +3,8 @@
 Every test maps to one or more acceptance criteria (AC-20.x).
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from mcp_sdk_py.common_types import (
@@ -13,9 +15,15 @@ from mcp_sdk_py.common_types import (
   UNSAFE_ICON_SCHEMES,
   BaseMetadata,
   Icon,
+  IconFetchError,
   IconTheme,
   Implementation,
+  _SafeIconRedirectHandler,
+  detect_image_mime_type,
+  fetch_icon,
   is_valid_size_entry,
+  resolve_tool_display_name,
+  validate_icon_data,
   validate_icon_src,
 )
 
@@ -143,20 +151,36 @@ class TestDisplayNameFallsBackToName:
 # ---------------------------------------------------------------------------
 
 class TestAnnotationsTitlePrecedence:
-  """AC-20.6: For tools, precedence is title → annotations.title → name.
+  """AC-20.6: For tools, precedence is title → annotations.title → name (R-14.1-e)."""
 
-  The annotations.title field belongs to Tool descriptors (§16, S24).  Here
-  we verify the BaseMetadata piece of the precedence rule: title always wins
-  over name when present, establishing the outer envelope of the rule.
-  """
+  def test_title_beats_annotations_title_beats_name(self):
+    """Full 3-tier precedence via resolve_tool_display_name (R-14.1-c, e, d)."""
+    assert resolve_tool_display_name(
+      "tool-id",
+      title="Explicit Title",
+      annotations_title="Annotations Title",
+    ) == "Explicit Title"
 
-  def test_title_beats_name(self):
-    meta = BaseMetadata(name="tool-id", title="User-Facing Name")
-    assert meta.display_name() == "User-Facing Name"
+  def test_annotations_title_beats_name_when_title_absent(self):
+    assert resolve_tool_display_name(
+      "tool-id",
+      title=None,
+      annotations_title="Annotations Title",
+    ) == "Annotations Title"
 
   def test_name_is_fallback_when_both_absent(self):
-    meta = BaseMetadata(name="tool-id")
-    assert meta.display_name() == "tool-id"
+    assert resolve_tool_display_name("tool-id", title=None, annotations_title=None) == "tool-id"
+
+  def test_title_wins_even_when_annotations_title_present(self):
+    result = resolve_tool_display_name(
+      "n", title="T", annotations_title="AT"
+    )
+    assert result == "T"
+
+  def test_basemetadata_display_name_two_tier(self):
+    """BaseMetadata.display_name() still implements the title → name two-tier rule."""
+    assert BaseMetadata(name="n", title="T").display_name() == "T"
+    assert BaseMetadata(name="n").display_name() == "n"
 
 
 # ---------------------------------------------------------------------------
@@ -274,30 +298,55 @@ class TestIconSrcScheme:
 # ---------------------------------------------------------------------------
 
 class TestIconDomainCheck:
-  """AC-20.12: Consumers SHOULD check icon URL domain trust."""
+  """AC-20.12: Consumers SHOULD check icon URL domain trust (R-14.2-e)."""
 
-  def test_icon_src_domain_check_is_consumers_responsibility(self):
-    """The SDK provides validate_icon_src() which rejects unsafe schemes.
-    Full same-domain checking is a consumer-side runtime policy (R-14.2-e).
-    """
-    # validate_icon_src enforces scheme safety
+  def test_icon_src_scheme_validation_enforces_safety(self):
+    """validate_icon_src enforces scheme allowlist — first line of icon safety."""
     validate_icon_src("https://trusted.example.com/icon.png")  # no exception
+
+  def test_cross_origin_redirect_blocked_by_safe_handler(self):
+    """_SafeIconRedirectHandler blocks cross-origin redirect (R-14.2-p)."""
+    handler = _SafeIconRedirectHandler("https://example.com/icon.png")
+    mock_req = MagicMock()
+    mock_req.full_url = "https://example.com/icon.png"
+    with pytest.raises(IconFetchError, match="Cross-origin"):
+      handler.redirect_request(
+        mock_req, None, 302, "Found", {},
+        "https://attacker.com/evil.png",
+      )
+
+  def test_same_origin_redirect_allowed(self):
+    """Redirect to same origin and scheme must not raise IconFetchError."""
+    import urllib.request as _ur
+    handler = _SafeIconRedirectHandler("https://example.com/icon.png")
+    orig_req = _ur.Request("https://example.com/icon.png")
+    # No IconFetchError expected for same-origin redirect
+    new_req = handler.redirect_request(
+      orig_req, MagicMock(), 302, "Found", {}, "https://example.com/icon-v2.png"
+    )
+    assert new_req is not None
 
 
 # ---------------------------------------------------------------------------
 # AC-20.13  SVG icons require additional precautions  [R-14.2-f]
-# (structural: rule documented; SVG precautions are consumer runtime policy)
 # ---------------------------------------------------------------------------
 
 class TestSVGPrecautions:
-  """AC-20.13: Consumers SHOULD apply extra precautions for SVG icons."""
+  """AC-20.13: SVG icons identified by magic bytes; consumers apply extra precautions."""
 
-  def test_svg_icon_construction_succeeds(self):
-    icon = Icon(
-      src="https://example.com/icon.svg",
-      mime_type="image/svg+xml",
-    )
-    assert icon.mime_type == "image/svg+xml"
+  def test_svg_detected_from_xml_magic_bytes(self):
+    svg_bytes = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>'
+    detected = detect_image_mime_type(svg_bytes)
+    assert detected == "image/svg+xml"
+
+  def test_svg_detected_from_svg_tag(self):
+    svg_bytes = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+    assert detect_image_mime_type(svg_bytes) == "image/svg+xml"
+
+  def test_svg_with_bom_detected(self):
+    bom = b'\xef\xbb\xbf'
+    svg_bytes = bom + b'<?xml version="1.0"?><svg/>'
+    assert detect_image_mime_type(svg_bytes) == "image/svg+xml"
 
 
 # ---------------------------------------------------------------------------
@@ -506,31 +555,82 @@ class TestIconSrcOnlyHttpsOrData:
 # ---------------------------------------------------------------------------
 
 class TestNoCrossOriginRedirect:
-  """AC-20.23: Consumer MUST NOT follow scheme changes or cross-origin redirects."""
+  """AC-20.23: Consumer MUST NOT follow cross-origin or scheme-change redirects (R-14.2-p)."""
 
-  def test_rule_is_structurally_documented(self):
-    """This rule governs HTTP fetch behaviour, not Icon construction.
-    The SDK enforces the scheme constraint at construction time (R-14.2-n/o).
-    Runtime redirect-following is the consumer's responsibility.
-    """
-    icon = Icon(src="https://example.com/icon.png")
-    assert icon.src.startswith("https://")
+  def test_cross_origin_redirect_raises_icon_fetch_error(self):
+    """fetch_icon must raise when redirected to a different origin."""
+    handler = _SafeIconRedirectHandler("https://example.com/icon.png")
+    mock_req = MagicMock()
+    mock_req.full_url = "https://example.com/icon.png"
+    with pytest.raises(IconFetchError, match="Cross-origin"):
+      handler.redirect_request(
+        mock_req, None, 302, "Found", {},
+        "https://evil.com/steal.png",
+      )
+
+  def test_scheme_change_redirect_rejected(self):
+    """A redirect that changes scheme (https→http) must be blocked."""
+    handler = _SafeIconRedirectHandler("https://example.com/icon.png")
+    mock_req = MagicMock()
+    mock_req.full_url = "https://example.com/icon.png"
+    with pytest.raises(IconFetchError, match="Cross-origin"):
+      handler.redirect_request(
+        mock_req, None, 302, "Found", {},
+        "http://example.com/icon.png",  # scheme changed
+      )
 
 
 # ---------------------------------------------------------------------------
 # AC-20.24  Icon fetched without credentials  [R-14.2-q]
-# (structural: rule is documented; enforcement is at HTTP fetch time)
 # ---------------------------------------------------------------------------
 
 class TestIconFetchedWithoutCredentials:
-  """AC-20.24: No cookies, Authorization header, or credentials in icon fetch."""
+  """AC-20.24: fetch_icon MUST NOT send cookies, Authorization, or client credentials."""
 
-  def test_rule_is_structurally_modeled(self):
-    """Credential-free fetching is a consumer fetch-time policy (R-14.2-q).
-    The SDK validates src scheme at construction; credential stripping happens
-    in the HTTP layer.
-    """
-    assert "https" in ALLOWED_ICON_SCHEMES
+  _PNG = b'\x89PNG\r\n\x1a\n' + bytes(100)
+
+  def test_fetch_icon_issues_no_authorization_header(self):
+    """The Request object created by fetch_icon must have no Authorization header."""
+    captured: list = []
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = self._PNG
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    def capture_open(req, timeout=None):
+      captured.append(req)
+      return mock_resp
+
+    mock_opener = MagicMock()
+    mock_opener.open.side_effect = capture_open
+
+    with patch("mcp_sdk_py.common_types.urllib.request.build_opener", return_value=mock_opener):
+      fetch_icon("https://example.com/icon.png")
+
+    req = captured[0]
+    assert req.get_header("Authorization") is None
+
+  def test_fetch_icon_does_not_add_cookie_header(self):
+    """No Cookie header should be injected into the icon request."""
+    captured: list = []
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = self._PNG
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    def capture_open(req, timeout=None):
+      captured.append(req)
+      return mock_resp
+
+    mock_opener = MagicMock()
+    mock_opener.open.side_effect = capture_open
+
+    with patch("mcp_sdk_py.common_types.urllib.request.build_opener", return_value=mock_opener):
+      fetch_icon("https://example.com/icon.png")
+
+    req = captured[0]
+    cookie = req.get_header("Cookie")
+    assert cookie is None or cookie == ""
 
 
 # ---------------------------------------------------------------------------
@@ -538,19 +638,120 @@ class TestIconFetchedWithoutCredentials:
 # AC-20.26  Declared type is advisory; detect from magic bytes  [R-14.2-s]
 # AC-20.27  Mismatch or unknown type → reject  [R-14.2-t]
 # AC-20.28  Strict allowlist; types outside it rejected  [R-14.2-u]
-# (structural: these are consumer runtime policies, modeled via constants)
 # ---------------------------------------------------------------------------
 
 class TestIconContentValidation:
-  """AC-20.25–20.28: Content-type validation rules are modeled as constants."""
+  """AC-20.25–20.28: Magic-byte detection, mismatch rejection, allowlist enforcement."""
+
+  _PNG = b'\x89PNG\r\n\x1a\n' + bytes(100)
+  _JPEG = b'\xff\xd8\xff\xe0' + bytes(100)
+  _WEBP = b'RIFF\x00\x00\x00\x00WEBP' + bytes(100)
+  _SVG = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>'
+  _NOT_IMAGE = b'not an image at all, just text bytes'
+
+  # AC-20.26: magic bytes determine type, not declared mimeType
+
+  def test_detect_png_from_magic_bytes(self):
+    assert detect_image_mime_type(self._PNG) == "image/png"
+
+  def test_detect_jpeg_from_magic_bytes(self):
+    assert detect_image_mime_type(self._JPEG) == "image/jpeg"
+
+  def test_detect_webp_from_magic_bytes(self):
+    assert detect_image_mime_type(self._WEBP) == "image/webp"
+
+  def test_detect_svg_from_magic_bytes(self):
+    assert detect_image_mime_type(self._SVG) == "image/svg+xml"
+
+  def test_unknown_content_returns_none(self):
+    assert detect_image_mime_type(self._NOT_IMAGE) is None
+
+  # AC-20.25: validate_icon_data checks both type and content
+
+  def test_validate_icon_data_accepts_valid_png(self):
+    detected = validate_icon_data(self._PNG)
+    assert detected == "image/png"
+
+  def test_validate_icon_data_accepts_correct_declared_type(self):
+    detected = validate_icon_data(self._PNG, declared_mime_type="image/png")
+    assert detected == "image/png"
+
+  # AC-20.26 + AC-20.27: declared type is advisory; mismatch is rejected
+
+  def test_validate_icon_data_rejects_declared_mime_mismatch(self):
+    """Declaring image/webp but sending PNG bytes must be rejected (R-14.2-t)."""
+    with pytest.raises(IconFetchError, match="mismatch"):
+      validate_icon_data(self._PNG, declared_mime_type="image/webp")
+
+  def test_validate_icon_data_ignores_declared_type_for_detection(self):
+    """Declared type is advisory; magic bytes are the source of truth (R-14.2-s)."""
+    # JPEG bytes with a wrong declared type must still be caught by magic bytes
+    with pytest.raises(IconFetchError, match="mismatch"):
+      validate_icon_data(self._JPEG, declared_mime_type="image/png")
+
+  # AC-20.27: unknown type rejected
+
+  def test_validate_icon_data_rejects_unknown_content_type(self):
+    with pytest.raises(IconFetchError, match="not a recognized image"):
+      validate_icon_data(self._NOT_IMAGE)
+
+  # AC-20.28: strict allowlist enforced
+
+  def test_validate_icon_data_rejects_type_outside_allowlist(self):
+    """GIF is detectable but outside SUPPORTED_MIME_TYPES — must be rejected."""
+    gif_bytes = b'GIF89a' + bytes(50)
+    assert detect_image_mime_type(gif_bytes) is None  # not in our detection set
+    with pytest.raises(IconFetchError):
+      validate_icon_data(gif_bytes)
 
   def test_supported_mime_types_form_the_allowlist(self):
-    """R-14.2-u: maintain a strict allowlist; only these types are permitted."""
-    assert len(SUPPORTED_MIME_TYPES) >= 5   # png, jpeg, jpg, svg, webp
-
-  def test_unknown_type_would_not_be_in_allowlist(self):
+    """R-14.2-u: only types in SUPPORTED_MIME_TYPES are accepted."""
+    assert len(SUPPORTED_MIME_TYPES) >= 5
     assert "image/bmp" not in SUPPORTED_MIME_TYPES
     assert "image/tiff" not in SUPPORTED_MIME_TYPES
+
+  # data: URI fetch (no network required)
+
+  def test_fetch_icon_data_uri_valid_png(self):
+    """fetch_icon decodes data: URI base64 payload and validates magic bytes."""
+    import base64
+    b64 = base64.b64encode(self._PNG).decode()
+    result = fetch_icon(f"data:image/png;base64,{b64}")
+    assert result == self._PNG
+
+  def test_fetch_icon_data_uri_mime_mismatch_rejected(self):
+    """data: URI with declared image/webp but PNG bytes must be rejected."""
+    import base64
+    b64 = base64.b64encode(self._PNG).decode()
+    with pytest.raises(IconFetchError, match="mismatch"):
+      fetch_icon(f"data:image/webp;base64,{b64}")
+
+  def test_fetch_icon_https_success(self):
+    """fetch_icon returns validated bytes for a valid https: PNG response."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = self._PNG
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    mock_opener = MagicMock()
+    mock_opener.open.return_value = mock_resp
+
+    with patch("mcp_sdk_py.common_types.urllib.request.build_opener", return_value=mock_opener):
+      result = fetch_icon("https://example.com/icon.png")
+
+    assert result == self._PNG
+
+  def test_fetch_icon_https_rejects_non_image_response(self):
+    """HTTP response with non-image bytes must raise IconFetchError (R-14.2-t)."""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"<html><body>Not an image</body></html>"
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    mock_opener = MagicMock()
+    mock_opener.open.return_value = mock_resp
+
+    with patch("mcp_sdk_py.common_types.urllib.request.build_opener", return_value=mock_opener):
+      with pytest.raises(IconFetchError):
+        fetch_icon("https://example.com/not-an-image.html")
 
 
 # ---------------------------------------------------------------------------
