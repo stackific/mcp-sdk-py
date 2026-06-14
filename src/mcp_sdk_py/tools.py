@@ -1128,8 +1128,16 @@ class ListToolsResult:
         f"nextCursor must be an opaque string when present; got "
         f"{type(self.next_cursor).__name__} (R-16.2-c)"
       )
+    # R-16.2-m: resultType is the REQUIRED discriminator and for a tools/list
+    # result its value MUST be exactly "complete" — a wrong value (e.g.
+    # "input_required") is rejected, not silently accepted.
     if not isinstance(self.result_type, str):
       raise TypeError("resultType must be a string (R-16.2-m)")
+    if self.result_type != RESULT_TYPE_COMPLETE:
+      raise ValueError(
+        f"resultType for a tools/list result MUST be {RESULT_TYPE_COMPLETE!r}; "
+        f"got {self.result_type!r} (R-16.2-m, §3.6)"
+      )
     if self.meta is not None and not isinstance(self.meta, dict):
       raise TypeError("_meta must be a JSON object when present (R-16.2-n)")
 
@@ -1236,14 +1244,16 @@ def validate_arguments_against_input_schema(
   default (in-document-only) resolution mode before checking the value. (The
   ``tools/call`` request that supplies these arguments is defined in S25.)
 
-  This performs the structural, dependency-free portion of validation that this
-  story owns: the root ``type`` is ``"object"``, so the arguments object MUST be
-  a JSON object, and references MUST resolve in-document only. Full keyword-level
-  JSON Schema evaluation is layered on top by the caller's schema engine; this
-  function guarantees the normative gates this story specifies.
+  Performs real JSON Schema 2020-12 evaluation of ``arguments`` against the
+  tool's ``inputSchema`` — ``type``, ``required``, ``properties``,
+  ``additionalProperties``, and the other keywords (see ``_json_schema_validate``)
+  — returning False when the arguments do not conform (wrong type, missing
+  required property, property barred by ``additionalProperties: false``, etc.) so
+  a server never executes a tool with invalid arguments (R-16.4-o). References
+  are resolved in-document only (R-16.4-r).
 
   Returns:
-    True if ``arguments`` satisfies the structural gates.
+    True iff ``arguments`` conforms to the tool's ``inputSchema``.
 
   Raises:
     ExternalReferenceError: the schema depends on an unresolved external
@@ -1252,8 +1262,10 @@ def validate_arguments_against_input_schema(
   # R-16.4-r: apply the same in-document-only reference rules during local
   # validation. The default resolution_mode forbids external dereferencing.
   resolve_references(tool.input_schema, resolution_mode)
-  # R-16.4-d: inputSchema root type is "object", so arguments MUST be an object.
-  return isinstance(arguments, dict)
+  # R-16.4-o: evaluate the arguments object against the full inputSchema.
+  return _json_schema_validate(
+    arguments, tool.input_schema, tool.input_schema, resolution_mode=resolution_mode
+  )
 
 
 def structured_content_conforms(
@@ -1272,12 +1284,12 @@ def structured_content_conforms(
 
   When no ``outputSchema`` is declared, ``structuredContent`` MAY be any JSON
   value of any type (R-16.4-v), so this returns True. When an ``outputSchema``
-  is present, its root ``type`` is unrestricted (R-16.4-e); this enforces the
-  in-document reference rules and the structural root-type gate, leaving deeper
-  keyword evaluation to the caller's schema engine.
+  is present, its root ``type`` is unrestricted (R-16.4-e) and the value is
+  evaluated against the full schema via real JSON Schema 2020-12 validation,
+  with in-document-only ``$ref`` resolution (R-16.4-r).
 
   Returns:
-    True if the value satisfies the structural gates (always True when no
+    True iff the value conforms to the ``outputSchema`` (always True when no
     ``outputSchema`` is declared).
 
   Raises:
@@ -1289,11 +1301,10 @@ def structured_content_conforms(
     return True
   # R-16.4-r: in-document-only reference rules during local validation.
   resolve_references(tool.output_schema, resolution_mode)
-  root_type = tool.output_schema.get("type")
-  if root_type is None:
-    # No root-type constraint declared — any JSON value is structurally allowed.
-    return True
-  return _value_matches_json_type(structured_content, root_type)
+  # R-16.4-p/q: structuredContent MUST conform to the declared outputSchema.
+  return _json_schema_validate(
+    structured_content, tool.output_schema, tool.output_schema, resolution_mode=resolution_mode
+  )
 
 
 #: Maps a JSON Schema ``type`` keyword to the Python types that satisfy it.
@@ -1321,6 +1332,316 @@ def _value_matches_json_type(value: Any, declared_type: Any) -> bool:
   if predicate is None:
     return True
   return predicate(value)
+
+
+# ---------------------------------------------------------------------------
+# §16.4  JSON Schema 2020-12 value validation  [R-16.4-o, R-16.4-p, R-16.4-r]
+# ---------------------------------------------------------------------------
+#
+# A dependency-free evaluator for the JSON Schema 2020-12 keywords used by tool
+# argument/output schemas. It is the engine behind R-16.4-o (a server MUST
+# validate arguments against inputSchema) and R-16.4-p/q (structuredContent
+# conforms to outputSchema). References are resolved in-document only, per the
+# same rule R-16.4-r requires of local validation: a ``$ref`` whose target is
+# outside the document is never fetched — it raises ExternalReferenceError —
+# and an unresolved in-document ``$ref`` is rejected rather than treated as
+# permissive (R-16.4-k).
+
+#: Cap on validation recursion so a pathological recursive ``$ref`` cannot
+#: exhaust the stack (R-16.4-l); finite data normally bounds depth well below.
+_MAX_VALIDATION_DEPTH: int = 200
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+  """JSON value equality for ``enum`` / ``const`` (distinguishes booleans from numbers).
+
+  JSON treats ``true`` and ``1`` as distinct values; Python's ``True == 1`` would
+  conflate them, so booleans only compare equal to booleans.
+  """
+  if isinstance(a, bool) or isinstance(b, bool):
+    return type(a) is bool and type(b) is bool and a == b
+  if isinstance(a, list) and isinstance(b, list):
+    return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
+  if isinstance(a, dict) and isinstance(b, dict):
+    return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+  if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+    return a == b
+  return type(a) is type(b) and a == b
+
+
+def _find_anchor(node: Any, anchor: str) -> Any:
+  """Find the in-document subschema declaring ``$anchor: anchor`` (R-16.4-f)."""
+  if isinstance(node, dict):
+    if node.get("$anchor") == anchor:
+      return node
+    for value in node.values():
+      found = _find_anchor(value, anchor)
+      if found is not None:
+        return found
+  elif isinstance(node, list):
+    for item in node:
+      found = _find_anchor(item, anchor)
+      if found is not None:
+        return found
+  return None
+
+
+def _resolve_in_document_ref(ref: str, root: Any) -> Any:
+  """Resolve an in-document ``$ref`` (JSON Pointer or ``$anchor``) against ``root``.
+
+  Returns the target subschema, or None when it does not resolve within the
+  document (an unresolved in-document reference, rejected by the caller per
+  R-16.4-k rather than treated as permissive).
+  """
+  if ref in ("#", ""):
+    return root
+  if ref.startswith("#/"):
+    node: Any = root
+    for raw in ref[2:].split("/"):
+      token = raw.replace("~1", "/").replace("~0", "~")
+      if isinstance(node, dict) and token in node:
+        node = node[token]
+      elif isinstance(node, list):
+        try:
+          node = node[int(token)]
+        except (ValueError, IndexError):
+          return None
+      else:
+        return None
+    return node
+  if ref.startswith("#"):
+    return _find_anchor(root, ref[1:])
+  return None
+
+
+def _json_schema_validate(
+  value: Any,
+  schema: Any,
+  root: Any,
+  *,
+  resolution_mode: SchemaResolutionMode | None = None,
+  depth: int = 0,
+) -> bool:
+  """Validate ``value`` against a JSON Schema 2020-12 ``schema`` (R-16.4-o/p).
+
+  Evaluates the structural and constraint keywords commonly used by tool
+  schemas: ``type``, ``enum``, ``const``, object keywords (``properties``,
+  ``required``, ``additionalProperties``, ``patternProperties``,
+  ``min/maxProperties``), array keywords (``prefixItems``, ``items``,
+  ``min/maxItems``), string keywords (``min/maxLength``, ``pattern``), numeric
+  keywords (``minimum``/``maximum``/exclusive bounds, ``multipleOf``), and the
+  ``allOf``/``anyOf``/``oneOf``/``not`` combinators. ``$ref`` is resolved
+  in-document only (R-16.4-r); an external ``$ref`` raises ExternalReferenceError
+  unless an opt-in external mode is configured (R-16.4-h).
+
+  Returns True iff the value conforms.
+
+  Raises:
+    ExternalReferenceError: a ``$ref`` targets outside the document while
+      external dereferencing is disabled (R-16.4-r).
+    UnsafeSchemaError: validation recursion exceeds the safety bound (R-16.4-l).
+  """
+  if depth > _MAX_VALIDATION_DEPTH:
+    raise UnsafeSchemaError(
+      "validation_depth_exceeded",
+      f"value validation recursion exceeds the bound of {_MAX_VALIDATION_DEPTH} (R-16.4-l)",
+    )
+  # Boolean schemas: ``true`` accepts anything, ``false`` rejects everything.
+  if schema is True:
+    return True
+  if schema is False:
+    return False
+  if not isinstance(schema, dict):
+    return True  # not a schema object — nothing to assert
+
+  # $ref — resolve in-document; external refs are never fetched (R-16.4-f/r).
+  ref = schema.get("$ref")
+  if isinstance(ref, str):
+    if reference_is_in_document(ref):
+      target = _resolve_in_document_ref(ref, root)
+      if target is None:
+        return False  # unresolved in-document ref → reject (R-16.4-k)
+      if not _json_schema_validate(
+        value, target, root, resolution_mode=resolution_mode, depth=depth + 1
+      ):
+        return False
+    elif resolution_mode is None or not resolution_mode.allow_external:
+      raise ExternalReferenceError(ref)
+    # else: opt-in external mode is configured but this SDK performs no fetch,
+    # so the external target cannot be evaluated locally and is not asserted.
+
+  # type
+  declared_type = schema.get("type")
+  if declared_type is not None and not _value_matches_json_type(value, declared_type):
+    return False
+
+  # enum / const
+  if "enum" in schema and not any(_json_equal(value, e) for e in schema["enum"]):
+    return False
+  if "const" in schema and not _json_equal(value, schema["const"]):
+    return False
+
+  # object keywords
+  if isinstance(value, dict):
+    if not _validate_object_keywords(value, schema, root, resolution_mode, depth):
+      return False
+
+  # array keywords
+  if isinstance(value, list):
+    if not _validate_array_keywords(value, schema, root, resolution_mode, depth):
+      return False
+
+  # string keywords
+  if isinstance(value, str):
+    min_len = schema.get("minLength")
+    max_len = schema.get("maxLength")
+    if isinstance(min_len, int) and len(value) < min_len:
+      return False
+    if isinstance(max_len, int) and len(value) > max_len:
+      return False
+    pattern = schema.get("pattern")
+    if isinstance(pattern, str) and re.search(pattern, value) is None:
+      return False
+
+  # numeric keywords (booleans are not numbers in JSON Schema)
+  if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if not _validate_numeric_keywords(value, schema):
+      return False
+
+  # combinators
+  for sub in schema.get("allOf", []) or []:
+    if not _json_schema_validate(value, sub, root, resolution_mode=resolution_mode, depth=depth + 1):
+      return False
+  if "anyOf" in schema and not any(
+    _json_schema_validate(value, sub, root, resolution_mode=resolution_mode, depth=depth + 1)
+    for sub in schema["anyOf"]
+  ):
+    return False
+  if "oneOf" in schema:
+    matches = sum(
+      1
+      for sub in schema["oneOf"]
+      if _json_schema_validate(value, sub, root, resolution_mode=resolution_mode, depth=depth + 1)
+    )
+    if matches != 1:
+      return False
+  if "not" in schema and _json_schema_validate(
+    value, schema["not"], root, resolution_mode=resolution_mode, depth=depth + 1
+  ):
+    return False
+
+  return True
+
+
+def _validate_object_keywords(
+  value: dict[str, Any],
+  schema: dict[str, Any],
+  root: Any,
+  resolution_mode: SchemaResolutionMode | None,
+  depth: int,
+) -> bool:
+  """Apply the object-applicator keywords (``required``/``properties``/etc.)."""
+  for name in schema.get("required", []) or []:
+    if name not in value:
+      return False  # missing required property (R-16.4-o)
+
+  properties = schema.get("properties")
+  properties = properties if isinstance(properties, dict) else {}
+  pattern_properties = schema.get("patternProperties")
+  pattern_properties = pattern_properties if isinstance(pattern_properties, dict) else {}
+  additional = schema.get("additionalProperties", True)
+
+  for key, item in value.items():
+    handled = False
+    if key in properties:
+      handled = True
+      if not _json_schema_validate(
+        item, properties[key], root, resolution_mode=resolution_mode, depth=depth + 1
+      ):
+        return False
+    for pattern, subschema in pattern_properties.items():
+      if re.search(pattern, key) is not None:
+        handled = True
+        if not _json_schema_validate(
+          item, subschema, root, resolution_mode=resolution_mode, depth=depth + 1
+        ):
+          return False
+    if not handled:
+      if additional is False:
+        return False  # extra property barred by additionalProperties:false
+      if isinstance(additional, dict) and not _json_schema_validate(
+        item, additional, root, resolution_mode=resolution_mode, depth=depth + 1
+      ):
+        return False
+
+  min_props = schema.get("minProperties")
+  max_props = schema.get("maxProperties")
+  if isinstance(min_props, int) and len(value) < min_props:
+    return False
+  if isinstance(max_props, int) and len(value) > max_props:
+    return False
+  return True
+
+
+def _validate_array_keywords(
+  value: list[Any],
+  schema: dict[str, Any],
+  root: Any,
+  resolution_mode: SchemaResolutionMode | None,
+  depth: int,
+) -> bool:
+  """Apply the array-applicator keywords (``prefixItems``/``items``/etc.)."""
+  prefix = schema.get("prefixItems")
+  if isinstance(prefix, list):
+    for i, subschema in enumerate(prefix):
+      if i < len(value) and not _json_schema_validate(
+        value[i], subschema, root, resolution_mode=resolution_mode, depth=depth + 1
+      ):
+        return False
+    remainder = value[len(prefix):]
+  else:
+    remainder = value
+
+  items = schema.get("items")
+  if items is False:
+    if remainder:
+      return False
+  elif isinstance(items, dict):
+    for element in remainder:
+      if not _json_schema_validate(
+        element, items, root, resolution_mode=resolution_mode, depth=depth + 1
+      ):
+        return False
+
+  min_items = schema.get("minItems")
+  max_items = schema.get("maxItems")
+  if isinstance(min_items, int) and len(value) < min_items:
+    return False
+  if isinstance(max_items, int) and len(value) > max_items:
+    return False
+  return True
+
+
+def _validate_numeric_keywords(value: int | float, schema: dict[str, Any]) -> bool:
+  """Apply the numeric-constraint keywords (bounds and ``multipleOf``)."""
+  minimum = schema.get("minimum")
+  maximum = schema.get("maximum")
+  exclusive_min = schema.get("exclusiveMinimum")
+  exclusive_max = schema.get("exclusiveMaximum")
+  if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and value < minimum:
+    return False
+  if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and value > maximum:
+    return False
+  if isinstance(exclusive_min, (int, float)) and not isinstance(exclusive_min, bool) and value <= exclusive_min:
+    return False
+  if isinstance(exclusive_max, (int, float)) and not isinstance(exclusive_max, bool) and value >= exclusive_max:
+    return False
+  multiple_of = schema.get("multipleOf")
+  if isinstance(multiple_of, (int, float)) and not isinstance(multiple_of, bool) and multiple_of > 0:
+    quotient = value / multiple_of
+    if abs(quotient - round(quotient)) > 1e-9:
+      return False
+  return True
 
 
 # ---------------------------------------------------------------------------

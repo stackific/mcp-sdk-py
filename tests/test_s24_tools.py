@@ -904,3 +904,118 @@ def test_no_parameter_tool_wire_example():
   )
   assert tool.input_schema == {"type": "object", "additionalProperties": False}
   assert tool.output_schema["type"] == "array"
+
+
+# ---------------------------------------------------------------------------
+# R-16.4-o — a server MUST validate arguments against inputSchema before
+# executing the tool: real JSON Schema 2020-12 evaluation, not just isinstance.
+# ---------------------------------------------------------------------------
+
+def test_r_16_4_o_rejects_wrong_type_argument():
+  tool = make_tool(
+    "weather",
+    input_schema={
+      "type": "object",
+      "properties": {"location": {"type": "string"}},
+      "required": ["location"],
+    },
+  )
+  assert validate_arguments_against_input_schema(tool, {"location": "NYC"}) is True
+  # Wrong JSON type for a declared property — must NOT be accepted.
+  assert validate_arguments_against_input_schema(tool, {"location": 42}) is False
+
+
+def test_r_16_4_o_rejects_missing_required_argument():
+  tool = make_tool(
+    "weather",
+    input_schema={
+      "type": "object",
+      "properties": {"location": {"type": "string"}},
+      "required": ["location"],
+    },
+  )
+  assert validate_arguments_against_input_schema(tool, {}) is False
+
+
+def test_r_16_4_o_rejects_additional_property_when_barred():
+  tool = make_tool(
+    "weather",
+    input_schema={
+      "type": "object",
+      "properties": {"location": {"type": "string"}},
+      "additionalProperties": False,
+    },
+  )
+  assert validate_arguments_against_input_schema(tool, {"location": "NYC"}) is True
+  assert validate_arguments_against_input_schema(tool, {"location": "NYC", "extra": 1}) is False
+
+
+def test_r_16_4_o_enum_const_and_numeric_bounds():
+  tool = make_tool(
+    "t",
+    input_schema={
+      "type": "object",
+      "properties": {
+        "mode": {"enum": ["fast", "slow"]},
+        "count": {"type": "integer", "minimum": 1, "maximum": 10},
+        "flag": {"const": True},
+      },
+      "required": ["mode"],
+    },
+  )
+  assert validate_arguments_against_input_schema(tool, {"mode": "fast", "count": 5, "flag": True}) is True
+  assert validate_arguments_against_input_schema(tool, {"mode": "warp"}) is False        # enum
+  assert validate_arguments_against_input_schema(tool, {"mode": "fast", "count": 0}) is False   # < minimum
+  assert validate_arguments_against_input_schema(tool, {"mode": "fast", "count": 11}) is False  # > maximum
+  assert validate_arguments_against_input_schema(tool, {"mode": "fast", "flag": 1}) is False    # const true != 1
+
+
+def test_r_16_4_o_in_document_ref_validation():
+  tool = make_tool(
+    "t",
+    input_schema={
+      "type": "object",
+      "properties": {"node": {"$ref": "#/$defs/Node"}},
+      "required": ["node"],
+      "$defs": {
+        "Node": {"type": "object", "properties": {"k": {"type": "integer"}}, "required": ["k"]}
+      },
+    },
+  )
+  assert validate_arguments_against_input_schema(tool, {"node": {"k": 7}}) is True
+  assert validate_arguments_against_input_schema(tool, {"node": {"k": "no"}}) is False  # nested wrong type
+  assert validate_arguments_against_input_schema(tool, {"node": {}}) is False           # nested missing required
+
+
+def test_r_16_4_p_structured_content_conforms_to_output_schema():
+  tool = make_tool(
+    "t",
+    output_schema={
+      "type": "object",
+      "properties": {"n": {"type": "integer"}},
+      "required": ["n"],
+    },
+  )
+  assert structured_content_conforms(tool, {"n": 1}) is True
+  assert structured_content_conforms(tool, {}) is False          # missing required
+  assert structured_content_conforms(tool, {"n": "x"}) is False  # wrong type
+
+
+# ---------------------------------------------------------------------------
+# R-16.2-m — resultType MUST be exactly "complete" for a tools/list result;
+# a wrong value is rejected (not silently accepted).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["input_required", "banana", "Complete"])
+def test_r_16_2_m_rejects_non_complete_result_type(bad):
+  with pytest.raises(ValueError):
+    ListToolsResult.from_dict(
+      {"resultType": bad, "tools": [], "ttlMs": 0, "cacheScope": "public"}
+    )
+
+
+def test_r_16_2_m_accepts_complete_result_type():
+  result = ListToolsResult.from_dict(
+    {"resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "public"}
+  )
+  assert result.result_type == "complete"
