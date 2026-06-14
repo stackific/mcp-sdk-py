@@ -2,9 +2,12 @@
 
 Establishes the role topology (Host, Client, Server), message vocabulary
 (Request, Response, Notification), RFC 2119 requirement-keyword semantics,
-deprecation status, the Implementation descriptor, the mandatory conformance
-baseline, and the MissingCapabilityError that servers raise when a request
-requires an undeclared capability.
+deprecation status, the mandatory conformance baseline, and the
+MissingCapabilityError that servers raise when a request requires an undeclared
+capability.
+
+The Implementation descriptor's full shape is defined in S20
+(mcp_sdk_py.common_types); it is re-exported here for backwards compatibility.
 
 Every other module in this SDK depends on the definitions made here.
 """
@@ -12,8 +15,6 @@ Every other module in this SDK depends on the definitions made here.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
-from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -168,62 +169,10 @@ class DeprecationStatus(enum.Enum):
 # ---------------------------------------------------------------------------
 # §2.2.1  The Implementation descriptor  [R-2.2.1-a – R-2.2.1-g]
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Implementation:
-  """Identifies a concrete MCP software artifact on the wire (§2.2.1).
-
-  ``name`` and ``version`` are REQUIRED strings. ``title`` and ``icons`` are
-  OPTIONAL. Additional implementation-defined properties that arrive during
-  deserialization MUST be silently ignored by receivers that do not recognise
-  them (R-2.2.1-g, §2.3.4).
-
-  The full ``Icon`` shape is defined in §14 Common Data Types (S20); here
-  icons are kept as raw dicts because S20 has not yet been implemented.
-  """
-
-  name: str
-  version: str
-  title: str | None = None
-  icons: list[dict[str, Any]] | None = None
-
-  def __post_init__(self) -> None:
-    """Validate REQUIRED fields (R-2.2.1-b, R-2.2.1-c)."""
-    if not isinstance(self.name, str) or not self.name:
-      raise ValueError(
-        "Implementation.name is REQUIRED and must be a non-empty string"
-      )
-    if not isinstance(self.version, str) or not self.version:
-      raise ValueError(
-        "Implementation.version is REQUIRED and must be a non-empty string"
-      )
-    if self.title is not None and not isinstance(self.title, str):
-      raise TypeError("Implementation.title must be a string when present")
-    if self.icons is not None and not isinstance(self.icons, list):
-      raise TypeError("Implementation.icons must be a list when present")
-
-  @classmethod
-  def from_dict(cls, data: dict[str, Any]) -> "Implementation":
-    """Deserialise from a JSON-decoded dict, silently dropping unknown keys.
-
-    Receivers MUST ignore object members whose names they do not recognise
-    (§2.3.4, R-2.2.1-g). Unknown keys are dropped here rather than raising.
-    """
-    return cls(
-      name=data["name"],
-      version=data["version"],
-      title=data.get("title"),
-      icons=data.get("icons"),
-    )
-
-  def to_dict(self) -> dict[str, Any]:
-    """Serialise to a JSON-compatible dict, omitting absent optional fields."""
-    result: dict[str, Any] = {"name": self.name, "version": self.version}
-    if self.title is not None:
-      result["title"] = self.title
-    if self.icons is not None:
-      result["icons"] = self.icons
-    return result
+# Full shape (name, version, title, icons, description, websiteUrl) defined
+# in S20 / common_types.  Re-exported here so callers can continue to import
+# from mcp_sdk_py.foundations without breaking.
+from mcp_sdk_py.common_types import Implementation  # noqa: E402  re-export
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ reference to the story's acceptance-criteria table.
 
 import pytest
 
+from mcp_sdk_py.common_types import Icon
 from mcp_sdk_py.foundations import (
   CONFORMANCE_BASELINE,
   ConformanceError,
@@ -517,7 +518,7 @@ class TestImplementationOptionalFields:
     assert impl.title == "Example MCP Server"
 
   def test_icons_present(self):
-    icons = [{"src": "https://example.com/icon.png"}]
+    icons = [Icon(src="https://example.com/icon.png")]
     impl = Implementation(name="s", version="1", icons=icons)
     assert impl.icons == icons
 
@@ -532,7 +533,7 @@ class TestImplementationOptionalFields:
       name="s",
       version="1",
       title="My Server",
-      icons=[{"src": "https://example.com/icon.png"}],
+      icons=[Icon(src="https://example.com/icon.png")],
     )
     d = impl.to_dict()
     assert d["title"] == "My Server"
@@ -547,7 +548,7 @@ class TestImplementationOptionalFields:
     }
     impl = Implementation.from_dict(data)
     assert impl.title == "Example MCP Server"
-    assert impl.icons == [{"src": "https://example.com/icon.png"}]
+    assert impl.icons == [Icon(src="https://example.com/icon.png")]
 
 
 # ---------------------------------------------------------------------------
@@ -600,4 +601,4 @@ class TestImplementationIgnoresUnknownFields:
     assert impl.name == "example-mcp-server"
     assert impl.version == "1.4.2"
     assert impl.title == "Example MCP Server"
-    assert impl.icons == [{"src": "https://example.com/icon.png"}]
+    assert impl.icons == [Icon(src="https://example.com/icon.png")]
