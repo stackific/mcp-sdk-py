@@ -422,3 +422,88 @@ def build_cancel_notification(
   if not tracker.is_in_flight(request_id):
     raise CancellationTargetNotInFlightError(request_id)
   return CancelledNotificationParams(request_id=request_id, reason=reason)
+
+
+# ---------------------------------------------------------------------------
+# §15.2.3  Cancellation race-condition handling  [R-15.2.2-e/f, R-15.2.3-a–e]
+# ---------------------------------------------------------------------------
+
+class CancellationRegistry:
+  """Registry of request ids the local party has cancelled (R-15.2.3-e).
+
+  When a party sends notifications/cancelled for a request it records the id
+  so that any late response arriving after the cancellation can be identified
+  and ignored. This is the pure-logic affordance for cancellation race
+  tolerance; the physical late-response race only manifests once S16 streaming
+  lands, but the logic belongs here.
+
+  Usage:
+    registry = CancellationRegistry()
+    note = build_cancel_notification(tracker, request_id)
+    registry.cancel(request_id)       # record the cancellation
+    ...
+    if registry.should_ignore_response(incoming_id):
+      return                          # tolerate & ignore (R-15.2.3-d/e)
+  """
+
+  def __init__(self) -> None:
+    # Key is (type, value) so int 1 and str "1" are distinct (mirrors InFlightTracker).
+    self._cancelled: set[tuple[type, Any]] = set()
+
+  def _key(self, rid: RequestId) -> tuple[type, Any]:
+    return (type(rid), rid)
+
+  def cancel(self, request_id: RequestId) -> None:
+    """Record that the local party sent a cancellation for request_id."""
+    self._cancelled.add(self._key(request_id))
+
+  def should_ignore_response(self, request_id: RequestId) -> bool:
+    """Return True if a response for request_id should be gracefully ignored.
+
+    R-15.2.3-d: A response arriving after cancellation MUST be tolerated.
+    R-15.2.3-e: The cancelling party SHOULD ignore any such late response.
+    """
+    return self._key(request_id) in self._cancelled
+
+  def forget(self, request_id: RequestId) -> None:
+    """Remove a cancelled id once it no longer requires tracking (cleanup)."""
+    self._cancelled.discard(self._key(request_id))
+
+  @property
+  def cancelled_ids(self) -> frozenset[RequestId]:
+    """Frozenset snapshot of all currently tracked cancelled request ids."""
+    return frozenset(v for _, v in self._cancelled)
+
+
+def receive_cancellation(
+  tracker: InFlightTracker | None,
+  request_id: RequestId,
+  method: str | None = None,
+) -> bool:
+  """Determine if a received notifications/cancelled notification is actionable.
+
+  R-15.2.2-e: A receiver MAY ignore a cancellation when the referenced request
+    is unknown, when processing has already completed, or when the request cannot
+    be cancelled. This function returns False for all such cases.
+  R-15.2.2-f: Malformed cancellation notifications SHOULD be ignored (False).
+  R-15.2.3-a: The notification MAY arrive after the request has already finished.
+  R-15.2.3-b: MUST handle gracefully — no crash, no protocol violation.
+
+  Args:
+    tracker: The receiver's InFlightTracker for requests it is currently
+      processing. Pass None to treat all ids as unknown (always returns False).
+    request_id: The requestId from the notifications/cancelled params.
+    method: Optional method name of the original request; when provided and
+      non-cancellable (e.g. server/discover), returns False immediately.
+
+  Returns:
+    True: the cancellation is actionable — request_id is actively in-flight
+      and the method (if given) is cancellable. The receiver SHOULD stop.
+    False: the receiver MAY ignore this notification gracefully; covers:
+      tracker is None, id not in-flight, or method is non-cancellable.
+  """
+  if method is not None and not is_cancellable_method(method):
+    return False
+  if tracker is None:
+    return False
+  return tracker.is_in_flight(request_id)
