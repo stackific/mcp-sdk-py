@@ -12,7 +12,7 @@ Depends on: S04
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from mcp_sdk_py.result_error import RESULT_TYPE_COMPLETE, ResultType
 
@@ -116,16 +116,57 @@ def effective_ttl_ms(raw_ttl: Any) -> int | None:
   return raw_ttl
 
 
-def effective_cache_scope(raw_scope: Any) -> str:
+def effective_cache_scope(raw_scope: Any, *, can_distinguish_contexts: bool = True) -> str:
   """Return the effective cacheScope, defaulting to 'private' for unknown/missing.
 
   R-13.1-e: Any value that is not exactly "public" or "private" MUST be
   treated as "private" (the more conservative scope).
   R-13.1-f: An absent cacheScope is treated as malformed; decline to share.
+  R-13.3-h: A receiver that cannot reliably distinguish authorization contexts
+  MUST treat every cached result as "private".
+
+  Args:
+    raw_scope: The raw cacheScope value from the wire, or None if absent.
+    can_distinguish_contexts: When False, always returns "private" regardless
+      of the wire value (R-13.3-h).
   """
+  if not can_distinguish_contexts:
+    return CACHE_SCOPE_PRIVATE  # R-13.3-h: cannot distinguish → always private
   if raw_scope == CACHE_SCOPE_PUBLIC:
     return CACHE_SCOPE_PUBLIC
   return CACHE_SCOPE_PRIVATE
+
+
+class CacheScopeResult(NamedTuple):
+  """Classification result from classify_cache_scope (R-13.1-e/f)."""
+
+  scope: str      # effective scope to use ("public" or "private")
+  is_malformed: bool  # True when raw value was absent or not "public"/"private"
+
+
+def classify_cache_scope(
+  raw_scope: Any,
+  *,
+  can_distinguish_contexts: bool = True,
+) -> CacheScopeResult:
+  """Classify a cacheScope value, surfacing the malformed-vs-valid distinction.
+
+  Whereas effective_cache_scope() always returns a safe string for downstream
+  logic, this function additionally surfaces whether the raw value was absent or
+  unrecognized — allowing the caller to apply R-13.1-f (SHOULD: absent cacheScope
+  is malformed; decline to share the response).
+
+  Args:
+    raw_scope: The raw wire value, or None if the field is absent.
+    can_distinguish_contexts: Forwarded to effective_cache_scope (R-13.3-h).
+
+  Returns:
+    CacheScopeResult(scope, is_malformed) where is_malformed is True when
+    raw_scope is None or any value not in VALID_CACHE_SCOPES.
+  """
+  is_malformed = raw_scope not in VALID_CACHE_SCOPES
+  scope = effective_cache_scope(raw_scope, can_distinguish_contexts=can_distinguish_contexts)
+  return CacheScopeResult(scope=scope, is_malformed=is_malformed)
 
 
 def validate_caching_fields_paired(raw: dict[str, Any]) -> None:
@@ -231,7 +272,51 @@ def is_fresh(ttl_ms: int, received_at_ms: int, now_ms: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# §13.5  Pagination × caching  [R-13.5-f–h]
+# §13.4  Composed cache-reuse gate  [R-13.4-g, R-13.3-b/c/h]
+# ---------------------------------------------------------------------------
+
+def can_reuse_cached_result(
+  ttl_ms: int,
+  received_at_ms: int,
+  now_ms: int,
+  cache_scope: str,
+  *,
+  is_same_auth_context: bool = True,
+  can_distinguish_contexts: bool = True,
+) -> bool:
+  """Return True if a cached result may be reused right now (R-13.4-g).
+
+  A client that honors caching hints MUST respect BOTH constraints:
+  1. Freshness: is_fresh(ttl_ms, received_at_ms, now_ms)  (§13.2)
+  2. Scope permits serving for this caller                 (§13.3)
+
+  For "public" results any caller may reuse within the freshness interval.
+  For "private" results (or when contexts cannot be distinguished per R-13.3-h),
+  the caller must be the originating authorization context.  A shared
+  intermediary MUST NOT serve a "private" result to a different authorization
+  context (R-13.3-c) — pass is_same_auth_context=False to enforce this.
+
+  Args:
+    ttl_ms: ttlMs from the cached result.
+    received_at_ms: Local clock (ms) when the response was received.
+    now_ms: Current local clock (ms).
+    cache_scope: The cacheScope value from the cached result.
+    is_same_auth_context: Whether the current requester is the same authorization
+      context as the one that originated the cached response (R-13.3-c).
+    can_distinguish_contexts: When False, every result is treated as "private"
+      regardless of cacheScope (R-13.3-h).
+  """
+  if not is_fresh(ttl_ms, received_at_ms, now_ms):
+    return False
+  effective = effective_cache_scope(cache_scope, can_distinguish_contexts=can_distinguish_contexts)
+  if effective == CACHE_SCOPE_PUBLIC:
+    return True  # any authorization context may serve this result
+  # "private" — only the originating authorization context may reuse (R-13.3-b/c)
+  return is_same_auth_context
+
+
+# ---------------------------------------------------------------------------
+# §13.5  Pagination × caching  [R-13.5-f–i]
 # ---------------------------------------------------------------------------
 
 def validate_page_scope_consistency(scopes: list[str]) -> str:
@@ -250,3 +335,64 @@ def validate_page_scope_consistency(scopes: list[str]) -> str:
     return unique.pop() if unique else CACHE_SCOPE_PRIVATE
   # Inconsistent scopes → treat entire list as private (R-13.5-h).
   return CACHE_SCOPE_PRIVATE
+
+
+def assert_server_page_scope_consistent(scopes: list[str]) -> None:
+  """Assert that a server never emits mixed scopes across pages of one traversal.
+
+  R-13.5-g: A server MUST NOT mix "public" and "private" cacheScope across the
+  pages produced for a single list traversal.  This function is called server-side,
+  at result-emission time, to detect and reject such violations before they reach
+  the client.
+
+  For the client-side coercion (observe inconsistency → treat list as "private"),
+  use validate_page_scope_consistency() instead (R-13.5-h).
+
+  Raises:
+    ValueError: scopes contains both "public" and "private".
+  """
+  if CACHE_SCOPE_PUBLIC in scopes and CACHE_SCOPE_PRIVATE in scopes:
+    raise ValueError(
+      "server MUST NOT mix 'public' and 'private' cacheScope across pages "
+      "of a single list traversal (R-13.5-g)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# §13.5  Notification-based invalidation  [R-13.5-a, R-13.5-b, R-13.5-c]
+# ---------------------------------------------------------------------------
+
+#: Maps change notification method names to the cacheable result methods they
+#: invalidate.  A change notification takes precedence over a still-fresh ttlMs
+#: (R-13.5-c); the client SHOULD invalidate and re-fetch on receipt (R-13.5-a/b).
+NOTIFICATION_INVALIDATION_MAP: dict[str, frozenset[str]] = {
+  "notifications/tools/list_changed": frozenset({"tools/list"}),
+  "notifications/prompts/list_changed": frozenset({"prompts/list"}),
+  "notifications/resources/list_changed": frozenset({
+    "resources/list",
+    "resources/templates/list",
+  }),
+  "notifications/resources/updated": frozenset({"resources/read"}),
+}
+
+
+def invalidated_methods_for_notification(notification_method: str) -> frozenset[str]:
+  """Return the cacheable methods invalidated by a change notification (R-13.5-a).
+
+  A relevant change notification takes precedence over a still-fresh ttlMs
+  (R-13.5-c).  Returns an empty frozenset for unknown notification methods.
+  """
+  return NOTIFICATION_INVALIDATION_MAP.get(notification_method, frozenset())
+
+
+def should_invalidate_on_notification(
+  cached_method: str,
+  notification_method: str,
+) -> bool:
+  """Return True if this notification requires invalidating a cached result.
+
+  When True, the client SHOULD invalidate the cached entry and re-fetch before
+  relying on the result again, even if still within the ttlMs interval
+  (R-13.5-a, R-13.5-b, R-13.5-c).
+  """
+  return cached_method in invalidated_methods_for_notification(notification_method)

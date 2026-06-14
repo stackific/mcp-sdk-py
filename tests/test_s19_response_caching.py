@@ -3,7 +3,7 @@
 Coverage map (26 ACs):
   AC-19.1  → TestCacheableResultShape
   AC-19.2  → TestInvalidTtlMs
-  AC-19.3  → TestInvalidCacheScope
+  AC-19.3  → TestInvalidCacheScope, TestClassifyCacheScope
   AC-19.4  → TestCachingFieldsPaired
   AC-19.5  → TestTtlMsZeroImmediatelyStale
   AC-19.6  → TestFreshnessComputation
@@ -13,18 +13,18 @@ Coverage map (26 ACs):
   AC-19.10 → TestNoExtendBeyondInterval
   AC-19.11 → TestServerChoosesTtlMs
   AC-19.12 → TestPublicScopeReuse
-  AC-19.13 → TestPrivateScopeReuse
+  AC-19.13 → TestPrivateScopeReuse, TestCanReuseComposedGate
   AC-19.14 → TestCacheScopeNotSecurity
-  AC-19.15 → TestFallbackToPrivate
+  AC-19.15 → TestFallbackToPrivate, TestCanReuseComposedGate
   AC-19.16 → TestCacheableMethodsHaveBothFields
   AC-19.17 → TestServerDiscouragedCachingStillIncludesFields
   AC-19.18 → TestCacheScopeByDataDependency
   AC-19.19 → TestNonCacheableMessagesIgnoreFields
-  AC-19.20 → TestClientCachingPolicy
-  AC-19.21 → TestChangeNotificationInvalidatesCache
+  AC-19.20 → TestClientCachingPolicy, TestCanReuseComposedGate
+  AC-19.21 → TestChangeNotificationInvalidatesCache, TestNotificationInvalidation
   AC-19.22 → TestNoNotificationNoExtendedFreshness
   AC-19.23 → TestPerPageCaching
-  AC-19.24 → TestPageScopeConsistency
+  AC-19.24 → TestPageScopeConsistency, TestServerPageScopeConsistency
   AC-19.25 → TestInconsistentPageScopeTreatedAsPrivate
   AC-19.26 → TestCursorNotUsedForCacheBehavior
 """
@@ -35,12 +35,19 @@ from mcp_sdk_py.caching import (
   CACHEABLE_METHODS,
   CACHE_SCOPE_PRIVATE,
   CACHE_SCOPE_PUBLIC,
+  NOTIFICATION_INVALIDATION_MAP,
   VALID_CACHE_SCOPES,
   CacheableResult,
+  CacheScopeResult,
+  assert_server_page_scope_consistent,
+  can_reuse_cached_result,
+  classify_cache_scope,
   effective_cache_scope,
   effective_ttl_ms,
+  invalidated_methods_for_notification,
   is_fresh,
   is_valid_ttl_ms,
+  should_invalidate_on_notification,
   validate_cacheable_result,
   validate_caching_fields_paired,
   validate_page_scope_consistency,
@@ -376,12 +383,8 @@ class TestFallbackToPrivate:
 
   def test_receiver_cannot_distinguish_contexts_treats_as_private(self):
     """R-13.3-h: receiver that cannot distinguish auth contexts → always private."""
-    def receiver_effective_scope(raw_scope):
-      can_distinguish_contexts = False  # example: anonymous / shared cache
-      if not can_distinguish_contexts:
-        return CACHE_SCOPE_PRIVATE
-      return effective_cache_scope(raw_scope)
-    assert receiver_effective_scope("public") == CACHE_SCOPE_PRIVATE
+    assert effective_cache_scope("public", can_distinguish_contexts=False) == CACHE_SCOPE_PRIVATE
+    assert effective_cache_scope("private", can_distinguish_contexts=False) == CACHE_SCOPE_PRIVATE
 
 
 # ---------------------------------------------------------------------------
@@ -468,14 +471,15 @@ class TestClientCachingPolicy:
     assert r.ttl_ms == 600000  # hint available but not mandatory
 
   def test_client_honoring_hints_checks_both_freshness_and_scope(self):
+    """R-13.4-g: honors hints = respects BOTH freshness AND scope."""
     ttl = 60000
     received = 1000
     now_fresh = 1001
     now_stale = received + ttl + 1
-    # Fresh check
-    assert is_fresh(ttl, received, now_fresh)
-    # Stale check
-    assert not is_fresh(ttl, received, now_stale)
+    # Both constraints met → reuse allowed.
+    assert can_reuse_cached_result(ttl, received, now_fresh, "public")
+    # Stale → no reuse even if scope allows.
+    assert not can_reuse_cached_result(ttl, received, now_stale, "public")
 
 
 # ---------------------------------------------------------------------------
@@ -485,22 +489,13 @@ class TestClientCachingPolicy:
 class TestChangeNotificationInvalidatesCache:
   def test_notification_invalidates_despite_fresh_ttl(self):
     """On a relevant notification, cache must be invalidated even while fresh."""
-    cache = {
-      "tools/list": {
-        "result": CacheableResult(ttl_ms=600000, cache_scope="public"),
-        "received_at": 1000,
-      }
-    }
-    now = 2000  # still fresh
-    entry = cache["tools/list"]
-    assert is_fresh(entry["result"].ttl_ms, entry["received_at"], now)
-
-    # Simulate receiving notifications/tools/list_changed.
-    def on_tools_list_changed():
-      del cache["tools/list"]
-
-    on_tools_list_changed()
-    assert "tools/list" not in cache
+    now = 2000
+    received = 1000
+    ttl = 600000
+    # Confirm the result is still fresh...
+    assert is_fresh(ttl, received, now)
+    # ...but a relevant notification forces invalidation regardless (R-13.5-c).
+    assert should_invalidate_on_notification("tools/list", "notifications/tools/list_changed")
 
 
 # ---------------------------------------------------------------------------
@@ -589,3 +584,203 @@ class TestCursorNotUsedForCacheBehavior:
     key1 = make_page_cache_key("tools/list", {"cursor": "C1"})
     key2 = make_page_cache_key("tools/list", {"cursor": "C2"})
     assert key1 != key2
+
+
+# ---------------------------------------------------------------------------
+# Composed cache-reuse gate  (R-13.4-g, R-13.3-c/h)
+# ---------------------------------------------------------------------------
+
+class TestCanReuseComposedGate:
+  """AC-19.20 / AC-19.13 / AC-19.15 — respects BOTH freshness AND scope (R-13.4-g)."""
+
+  def test_fresh_public_is_reusable(self):
+    assert can_reuse_cached_result(5000, 1000, 2000, "public")
+
+  def test_stale_public_not_reusable(self):
+    """Freshness gate fails → no reuse even with public scope."""
+    assert not can_reuse_cached_result(5000, 1000, 10000, "public")
+
+  def test_fresh_private_same_context_is_reusable(self):
+    """R-13.3-b: private result may be reused by originating context."""
+    assert can_reuse_cached_result(5000, 1000, 2000, "private", is_same_auth_context=True)
+
+  def test_fresh_private_different_context_not_reusable(self):
+    """R-13.3-c: shared intermediary MUST NOT serve private result to different context."""
+    assert not can_reuse_cached_result(5000, 1000, 2000, "private", is_same_auth_context=False)
+
+  def test_stale_private_same_context_not_reusable(self):
+    """Both constraints must hold: stale even for same context."""
+    assert not can_reuse_cached_result(5000, 1000, 10000, "private", is_same_auth_context=True)
+
+  def test_cannot_distinguish_contexts_public_same_context_allowed(self):
+    """R-13.3-h: when cannot distinguish, public treated as private; same context still OK."""
+    assert can_reuse_cached_result(
+      5000, 1000, 2000, "public",
+      can_distinguish_contexts=False,
+      is_same_auth_context=True,
+    )
+
+  def test_cannot_distinguish_contexts_public_different_context_blocked(self):
+    """R-13.3-h: public result treated as private when context discrimination unavailable."""
+    assert not can_reuse_cached_result(
+      5000, 1000, 2000, "public",
+      can_distinguish_contexts=False,
+      is_same_auth_context=False,
+    )
+
+  def test_ttl_zero_never_reusable(self):
+    """ttlMs=0 is always stale; composed gate returns False (R-13.2-b)."""
+    assert not can_reuse_cached_result(0, 1000, 1000, "public")
+
+  def test_unknown_scope_treated_as_private(self):
+    """Unknown cacheScope → effective private; same-context gate applies."""
+    assert can_reuse_cached_result(5000, 1000, 2000, "shared", is_same_auth_context=True)
+    assert not can_reuse_cached_result(5000, 1000, 2000, "shared", is_same_auth_context=False)
+
+
+# ---------------------------------------------------------------------------
+# Server-side page scope consistency (R-13.5-f/g)
+# ---------------------------------------------------------------------------
+
+class TestServerPageScopeConsistency:
+  """AC-19.24 — Server MUST NOT mix scopes across pages (R-13.5-f/g)."""
+
+  def test_consistent_public_is_ok(self):
+    assert_server_page_scope_consistent(["public", "public", "public"])
+
+  def test_consistent_private_is_ok(self):
+    assert_server_page_scope_consistent(["private", "private"])
+
+  def test_mixed_scopes_raise(self):
+    """R-13.5-g: server MUST NOT mix public/private across pages."""
+    with pytest.raises(ValueError, match="MUST NOT mix"):
+      assert_server_page_scope_consistent(["public", "private"])
+
+  def test_mixed_scopes_raise_regardless_of_order(self):
+    with pytest.raises(ValueError, match="MUST NOT mix"):
+      assert_server_page_scope_consistent(["private", "public", "private"])
+
+  def test_single_page_is_ok(self):
+    assert_server_page_scope_consistent(["public"])
+    assert_server_page_scope_consistent(["private"])
+
+  def test_empty_list_is_ok(self):
+    """No pages to check — not a violation."""
+    assert_server_page_scope_consistent([])
+
+
+# ---------------------------------------------------------------------------
+# classify_cache_scope — malformed vs valid distinction  (R-13.1-f, RC-2)
+# ---------------------------------------------------------------------------
+
+class TestClassifyCacheScope:
+  """AC-19.3 / RC-2 — Absent cacheScope surfaces as malformed (R-13.1-f)."""
+
+  def test_valid_public_not_malformed(self):
+    result = classify_cache_scope("public")
+    assert result.scope == CACHE_SCOPE_PUBLIC
+    assert not result.is_malformed
+
+  def test_valid_private_not_malformed(self):
+    result = classify_cache_scope("private")
+    assert result.scope == CACHE_SCOPE_PRIVATE
+    assert not result.is_malformed
+
+  def test_absent_scope_is_malformed(self):
+    """R-13.1-f SHOULD: absent cacheScope is malformed; caller should decline to share."""
+    result = classify_cache_scope(None)
+    assert result.scope == CACHE_SCOPE_PRIVATE
+    assert result.is_malformed
+
+  def test_unrecognized_value_is_malformed(self):
+    """R-13.1-e: unrecognized value → treat as private; R-13.1-f: also malformed."""
+    result = classify_cache_scope("shared")
+    assert result.scope == CACHE_SCOPE_PRIVATE
+    assert result.is_malformed
+
+  def test_empty_string_is_malformed(self):
+    result = classify_cache_scope("")
+    assert result.scope == CACHE_SCOPE_PRIVATE
+    assert result.is_malformed
+
+  def test_cannot_distinguish_contexts_valid_public_not_malformed(self):
+    """Valid value stays not-malformed; scope is overridden to private by R-13.3-h."""
+    result = classify_cache_scope("public", can_distinguish_contexts=False)
+    assert result.scope == CACHE_SCOPE_PRIVATE
+    assert not result.is_malformed
+
+  def test_cannot_distinguish_contexts_absent_is_malformed(self):
+    result = classify_cache_scope(None, can_distinguish_contexts=False)
+    assert result.scope == CACHE_SCOPE_PRIVATE
+    assert result.is_malformed
+
+  def test_returns_cache_scope_result_namedtuple(self):
+    result = classify_cache_scope("public")
+    assert isinstance(result, CacheScopeResult)
+    assert hasattr(result, "scope")
+    assert hasattr(result, "is_malformed")
+
+
+# ---------------------------------------------------------------------------
+# Notification-based invalidation API  (R-13.5-a/b/c, RC-9)
+# ---------------------------------------------------------------------------
+
+class TestNotificationInvalidation:
+  """AC-19.21 — Notification invalidation API (R-13.5-a/b/c, RC-9)."""
+
+  def test_tools_changed_invalidates_tools_list(self):
+    assert should_invalidate_on_notification(
+      "tools/list", "notifications/tools/list_changed"
+    )
+
+  def test_prompts_changed_invalidates_prompts_list(self):
+    assert should_invalidate_on_notification(
+      "prompts/list", "notifications/prompts/list_changed"
+    )
+
+  def test_resources_changed_invalidates_resources_list(self):
+    assert should_invalidate_on_notification(
+      "resources/list", "notifications/resources/list_changed"
+    )
+
+  def test_resources_changed_invalidates_templates_list(self):
+    assert should_invalidate_on_notification(
+      "resources/templates/list", "notifications/resources/list_changed"
+    )
+
+  def test_resources_updated_invalidates_resources_read(self):
+    assert should_invalidate_on_notification(
+      "resources/read", "notifications/resources/updated"
+    )
+
+  def test_unknown_notification_invalidates_nothing(self):
+    assert not should_invalidate_on_notification("tools/list", "notifications/unknown")
+
+  def test_notification_does_not_cross_methods(self):
+    """Prompts notification does not invalidate tools cache."""
+    assert not should_invalidate_on_notification(
+      "tools/list", "notifications/prompts/list_changed"
+    )
+
+  def test_invalidated_methods_for_tools_notification(self):
+    methods = invalidated_methods_for_notification("notifications/tools/list_changed")
+    assert "tools/list" in methods
+
+  def test_invalidated_methods_for_unknown_returns_empty(self):
+    assert invalidated_methods_for_notification("notifications/unknown") == frozenset()
+
+  def test_map_covers_all_cacheable_methods(self):
+    """Every CACHEABLE_METHOD has at least one corresponding invalidation notification."""
+    all_invalidated: set[str] = set()
+    for methods in NOTIFICATION_INVALIDATION_MAP.values():
+      all_invalidated |= methods
+    assert CACHEABLE_METHODS == all_invalidated
+
+  def test_notification_takes_precedence_over_fresh_ttl(self):
+    """R-13.5-c: notification wins over still-fresh ttlMs."""
+    ttl, received, now = 600000, 1000, 2000
+    assert is_fresh(ttl, received, now)  # still fresh...
+    # ...but notification forces invalidation.
+    assert should_invalidate_on_notification(
+      "tools/list", "notifications/tools/list_changed"
+    )
