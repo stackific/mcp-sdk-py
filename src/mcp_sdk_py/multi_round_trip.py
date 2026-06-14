@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac as _hmac_module
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -181,6 +182,69 @@ class MalformedInputRequiredResultError(Exception):
   json_rpc_code: int = -32600
 
 
+class DuplicateInputRequestKeyError(MalformedInputRequiredResultError):
+  """Raised when a duplicate key is encountered while decoding an InputRequiredResult.
+
+  R-11.2-e: Keys in inputRequests MUST be unique.
+  R-11.2-g: A receiver encountering duplicate keys MUST treat the result as malformed.
+
+  Python's json.loads() silently collapses duplicates (last-wins), so detection
+  requires object_pairs_hook at decode time. Use decode_input_required_result_from_json()
+  instead of validate_input_required_result() on raw JSON text.
+
+  json_rpc_code: -32600 (inherited from MalformedInputRequiredResultError).
+  """
+
+  def __init__(self, key: str) -> None:
+    super().__init__(
+      f"Duplicate key {key!r} in inputRequests; keys MUST be unique (R-11.2-e, R-11.2-g)"
+    )
+    self.key: str = key
+
+
+class InputResponseKindMismatchError(Exception):
+  """Raised when an inputResponse value does not match the expected kind shape.
+
+  R-11.4-e: The InputResponse MUST be the result counterpart of the InputRequest kind
+    (ElicitResult↔elicitation/create, ListRootsResult↔roots/list,
+    CreateMessageResult↔sampling/createMessage).
+  R-11.4-f: A client MUST NOT answer with a mismatched kind.
+  R-11.5-s: A malformed retry value is a protocol error; the server MUST return a
+    JSON-RPC error rather than an InputRequiredResult.
+
+  json_rpc_code: -32600.
+  """
+
+  json_rpc_code: int = -32600
+
+  def __init__(self, key: str, kind: str, detail: str) -> None:
+    super().__init__(
+      f"inputResponses[{key!r}] is not a valid {kind!r} response: {detail} "
+      f"(R-11.4-e, R-11.4-f, R-11.5-s)"
+    )
+    self.key: str = key
+    self.kind: str = kind
+
+
+class UndeclaredInputKindError(Exception):
+  """Raised when a client receives an input-request kind it did not declare support for.
+
+  R-11.5-k: A client receiving an input-request kind it did not declare MUST treat
+    the result as an error, even if the kind is otherwise recognized.
+
+  json_rpc_code: -32600.
+  """
+
+  json_rpc_code: int = -32600
+
+  def __init__(self, kind: str) -> None:
+    super().__init__(
+      f"Received input-request kind {kind!r} which was not declared in client "
+      f"capabilities; the whole InputRequiredResult must be treated as an error (R-11.5-k)"
+    )
+    self.kind: str = kind
+
+
 class UnrecognizedInputRequestKindError(Exception):
   """Raised when an InputRequest carries an unrecognized method string.
 
@@ -343,6 +407,13 @@ def parse_input_response_params(raw: dict[str, Any]) -> InputResponseRequestPara
       f"inputResponses must be a JSON object if present; "
       f"got {type(input_responses).__name__}"
     )
+  if input_responses is not None:
+    for resp_key, resp_val in input_responses.items():
+      if not isinstance(resp_val, dict):
+        raise MalformedInputRequiredResultError(
+          f"inputResponses[{resp_key!r}] must be a JSON object (InputResponse); "
+          f"got {type(resp_val).__name__} — protocol-malformed retry (R-11.5-s)"
+        )
 
   request_state = raw.get("requestState")
   if request_state is not None and not isinstance(request_state, str):
@@ -521,3 +592,149 @@ def verify_hmac_request_state(token: str, secret_key: bytes) -> str:
     raise InvalidRequestStateError(
       f"requestState payload could not be decoded: {exc} (R-11.3-i)"
     ) from exc
+
+
+# ---------------------------------------------------------------------------
+# §11.2  Duplicate-key detection  [R-11.2-e, R-11.2-g]
+# ---------------------------------------------------------------------------
+
+def _no_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+  """object_pairs_hook: raise DuplicateInputRequestKeyError on any duplicate JSON key.
+
+  Python's json.loads() is last-wins for duplicate keys, so duplicates are
+  silently collapsed before reaching validate_input_required_result(). Using
+  this hook at decode time detects them before any information is lost.
+  """
+  result: dict[str, Any] = {}
+  for key, value in pairs:
+    if key in result:
+      raise DuplicateInputRequestKeyError(key)
+    result[key] = value
+  return result
+
+
+def decode_input_required_result_from_json(json_text: str) -> InputRequiredResult:
+  """Decode and validate an InputRequiredResult from a JSON string (R-11.2-g).
+
+  Uses object_pairs_hook to detect duplicate keys before they are collapsed
+  by Python's last-wins JSON decoder. Callers who receive raw JSON text MUST
+  use this function rather than json.loads() + validate_input_required_result()
+  to satisfy R-11.2-g.
+
+  Raises:
+    DuplicateInputRequestKeyError: A duplicate key was encountered anywhere in
+      the JSON object tree (inherits MalformedInputRequiredResultError, json_rpc_code -32600).
+    MalformedInputRequiredResultError: The result is otherwise structurally invalid.
+    json.JSONDecodeError: json_text is not valid JSON.
+  """
+  raw = json.loads(json_text, object_pairs_hook=_no_duplicate_pairs)
+  return validate_input_required_result(raw)
+
+
+# ---------------------------------------------------------------------------
+# §11.4  InputResponse kind-shape validation  [R-11.4-e, R-11.4-f, R-11.5-s]
+# ---------------------------------------------------------------------------
+
+#: Valid actions for an ElicitResult (elicitation/create response).
+_ELICIT_ACTIONS: frozenset[str] = frozenset({"accept", "decline", "cancel"})
+
+
+def validate_input_response_for_kind(key: str, kind: str, response: Any) -> None:
+  """Validate that response matches the expected shape for the given input-request kind.
+
+  R-11.4-e: The InputResponse MUST be the result counterpart of the InputRequest kind.
+  R-11.4-f: A client MUST NOT answer with a mismatched kind.
+  R-11.5-s: A malformed retry value is a protocol error.
+
+  Expected shapes:
+    elicitation/create  → ElicitResult: {action: "accept"|"decline"|"cancel", content?: ...}
+    sampling/createMessage → CreateMessageResult: {model: str, role: "assistant", content: {...}}
+    roots/list  → ListRootsResult: {roots: [...]}
+
+  Raises:
+    InputResponseKindMismatchError: response does not match the expected kind shape.
+  """
+  if not isinstance(response, dict):
+    raise InputResponseKindMismatchError(
+      key, kind,
+      f"must be a JSON object; got {type(response).__name__}"
+    )
+  if kind == INPUT_REQUEST_ELICITATION:
+    action = response.get("action")
+    if action not in _ELICIT_ACTIONS:
+      raise InputResponseKindMismatchError(
+        key, kind,
+        f"ElicitResult.action must be one of {sorted(_ELICIT_ACTIONS)!r}; got {action!r}"
+      )
+  elif kind == INPUT_REQUEST_SAMPLING:
+    model = response.get("model")
+    if not isinstance(model, str) or not model:
+      raise InputResponseKindMismatchError(
+        key, kind,
+        "CreateMessageResult must have a non-empty string 'model'"
+      )
+    if response.get("role") != "assistant":
+      raise InputResponseKindMismatchError(
+        key, kind,
+        f"CreateMessageResult 'role' must be 'assistant'; got {response.get('role')!r}"
+      )
+    if not isinstance(response.get("content"), dict):
+      raise InputResponseKindMismatchError(
+        key, kind,
+        "CreateMessageResult must have a 'content' object"
+      )
+  elif kind == INPUT_REQUEST_ROOTS:
+    if not isinstance(response.get("roots"), list):
+      raise InputResponseKindMismatchError(
+        key, kind,
+        "ListRootsResult must have a 'roots' array"
+      )
+
+
+def validate_input_responses_match_kinds(
+  input_requests: dict[str, InputRequest],
+  input_responses: dict[str, Any],
+) -> None:
+  """Validate each inputResponse value matches the shape for its request kind.
+
+  For each key in input_responses that has a corresponding entry in input_requests,
+  calls validate_input_response_for_kind to check the structural shape.
+
+  Used by:
+  - Clients before sending a retry (R-11.4-e, R-11.4-f, AC-17.19).
+  - Servers when processing a retry (R-11.5-s, AC-17.30).
+
+  Raises:
+    InputResponseKindMismatchError: response does not match kind (json_rpc_code -32600).
+  """
+  for resp_key, resp_val in input_responses.items():
+    if resp_key in input_requests:
+      validate_input_response_for_kind(resp_key, input_requests[resp_key].method, resp_val)
+
+
+# ---------------------------------------------------------------------------
+# §11.5  Client validation: undeclared kind  [R-11.5-k]
+# ---------------------------------------------------------------------------
+
+def validate_client_can_fulfill_input_requests(
+  meta: dict[str, Any],
+  input_requests: dict[str, InputRequest],
+) -> None:
+  """Raise if any input request kind was not declared by the client (R-11.5-k).
+
+  A client MUST treat an InputRequiredResult containing an input-request kind it
+  did not declare as an error, even when the kind is otherwise recognized
+  (R-11.5-k). This is stricter than the unrecognized-kind check (R-11.2-k): a
+  recognized-but-undeclared kind also causes an error.
+
+  Args:
+    meta: The _meta from the client's current request.
+    input_requests: The inputRequests map from the server's InputRequiredResult.
+
+  Raises:
+    UndeclaredInputKindError: Any input request kind is not in client capabilities
+      (json_rpc_code -32600).
+  """
+  for _, ir in input_requests.items():
+    if not client_supports_input_kind(meta, ir.method):
+      raise UndeclaredInputKindError(ir.method)

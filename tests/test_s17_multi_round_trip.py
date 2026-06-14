@@ -1,6 +1,6 @@
 """Tests for S17 — Multi-Round-Trip Requests (MRTR).
 
-Coverage map (31 ACs):
+Coverage map (31 story ACs + 4 conformance gaps):
   AC-17.1  → TestInputRequiredResultType
   AC-17.2  → TestInputRequestKinds
   AC-17.3  → TestAtLeastOneConstraint
@@ -32,6 +32,12 @@ Coverage map (31 ACs):
   AC-17.29 → TestInputRequestParamsMustBeObject
   AC-17.30 → TestIsLoadSheddingHelper
   AC-17.31 → TestResultTypeClassificationConstants
+
+Conformance gap fixes (story AC numbers from S17 traceability table):
+  AC-17.7  (R-11.2-e/f/g)  → TestDuplicateKeyDetection
+  AC-17.19 (R-11.4-e/f)    → TestInputResponseKindMatching
+  AC-17.26 (R-11.5-k)      → TestUndeclaredInputKind
+  AC-17.30 (R-11.5-s)      → TestMalformedRetryValues
 """
 
 import pytest
@@ -43,20 +49,27 @@ from mcp_sdk_py.multi_round_trip import (
   INPUT_REQUEST_SAMPLING,
   MRTR_METHODS,
   RECOGNIZED_INPUT_REQUEST_METHODS,
+  DuplicateInputRequestKeyError,
   InputRequest,
   InputRequiredResult,
   InputResponseRequestParams,
+  InputResponseKindMismatchError,
   InvalidRequestStateError,
   MalformedInputRequiredResultError,
   ResultTypeClassification,
+  UndeclaredInputKindError,
   UnrecognizedInputRequestKindError,
   classify_result_type,
   client_supports_input_kind,
+  decode_input_required_result_from_json,
   is_load_shedding_result,
   make_hmac_request_state,
   parse_input_request,
   parse_input_response_params,
+  validate_client_can_fulfill_input_requests,
   validate_input_required_result,
+  validate_input_response_for_kind,
+  validate_input_responses_match_kinds,
   validate_response_keys_match,
   verify_hmac_request_state,
 )
@@ -731,3 +744,247 @@ class TestResultTypeClassificationConstants:
   def test_error_codes_on_exceptions(self):
     assert MalformedInputRequiredResultError.json_rpc_code == -32600
     assert InvalidRequestStateError.json_rpc_code == -32600
+
+# ===========================================================================
+# Conformance gap fixes
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# AC-17.7 — Duplicate inputRequests keys → malformed  (R-11.2-e/f/g)
+# ---------------------------------------------------------------------------
+
+_ELICIT_RESULT_ACCEPT = {"action": "accept"}
+_CREATE_MSG_RESULT = {"model": "claude-3", "role": "assistant", "content": {"type": "text", "text": "hi"}}
+_LIST_ROOTS_RESULT = {"roots": [{"uri": "file:///home", "name": "home"}]}
+
+
+class TestDuplicateKeyDetection:
+  def test_unique_keys_parse_ok(self):
+    """Non-duplicate keys parse normally."""
+    json_text = '{"resultType":"input_required","inputRequests":{"a":{"method":"elicitation/create"},"b":{"method":"roots/list"}}}'
+    r = decode_input_required_result_from_json(json_text)
+    assert len(r.input_requests) == 2
+
+  def test_duplicate_input_requests_key_raises(self):
+    """Duplicate keys inside inputRequests MUST be detected (R-11.2-g)."""
+    # Python's json.loads is last-wins; our hook raises instead.
+    json_text = '{"resultType":"input_required","inputRequests":{"k":{"method":"elicitation/create"},"k":{"method":"roots/list"}}}'
+    with pytest.raises(DuplicateInputRequestKeyError) as exc_info:
+      decode_input_required_result_from_json(json_text)
+    assert exc_info.value.key == "k"
+
+  def test_duplicate_top_level_key_raises(self):
+    """Duplicate keys at any level are detected."""
+    json_text = '{"resultType":"input_required","resultType":"input_required","requestState":"tok"}'
+    with pytest.raises(DuplicateInputRequestKeyError):
+      decode_input_required_result_from_json(json_text)
+
+  def test_duplicate_key_error_is_malformed_subclass(self):
+    """DuplicateInputRequestKeyError IS a MalformedInputRequiredResultError."""
+    assert issubclass(DuplicateInputRequestKeyError, MalformedInputRequiredResultError)
+    assert DuplicateInputRequestKeyError.json_rpc_code == -32600
+
+  def test_invalid_json_raises_json_decode_error(self):
+    import json
+    with pytest.raises(json.JSONDecodeError):
+      decode_input_required_result_from_json("{not valid json}")
+
+  def test_nested_object_with_duplicate_key_raises(self):
+    """Duplicates anywhere in the tree are detected."""
+    json_text = '{"resultType":"input_required","requestState":"tok","_meta":{"k":1,"k":2}}'
+    with pytest.raises(DuplicateInputRequestKeyError):
+      decode_input_required_result_from_json(json_text)
+
+  def test_normal_dict_path_does_not_detect_dupes(self):
+    """validate_input_required_result() on a pre-decoded dict cannot detect dupes."""
+    # This is the known limitation: Python dicts cannot have duplicate keys.
+    raw = {"resultType": "input_required", "requestState": "tok"}
+    r = validate_input_required_result(raw)
+    assert r.request_state == "tok"
+
+
+# ---------------------------------------------------------------------------
+# AC-17.19 — inputResponse must match request kind  (R-11.4-e/f)
+# AC-17.30 — malformed retry → protocol error  (R-11.5-s)
+# ---------------------------------------------------------------------------
+
+class TestInputResponseKindMatching:
+  def test_elicitation_accept_valid(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": _ELICIT_RESULT_ACCEPT}
+    validate_input_responses_match_kinds(requests, responses)
+
+  def test_elicitation_decline_valid(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": {"action": "decline"}}
+    validate_input_responses_match_kinds(requests, responses)
+
+  def test_elicitation_cancel_valid(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": {"action": "cancel"}}
+    validate_input_responses_match_kinds(requests, responses)
+
+  def test_elicitation_invalid_action_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": {"action": "maybe"}}
+    with pytest.raises(InputResponseKindMismatchError) as exc_info:
+      validate_input_responses_match_kinds(requests, responses)
+    assert exc_info.value.key == "k"
+    assert exc_info.value.kind == INPUT_REQUEST_ELICITATION
+
+  def test_elicitation_missing_action_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": {"data": "something"}}
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_responses_match_kinds(requests, responses)
+
+  def test_sampling_valid(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
+    responses = {"k": _CREATE_MSG_RESULT}
+    validate_input_responses_match_kinds(requests, responses)
+
+  def test_sampling_wrong_role_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
+    responses = {"k": {"model": "gpt-4", "role": "user", "content": {}}}
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_responses_match_kinds(requests, responses)
+
+  def test_sampling_missing_model_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
+    responses = {"k": {"role": "assistant", "content": {}}}
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_responses_match_kinds(requests, responses)
+
+  def test_sampling_missing_content_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
+    responses = {"k": {"model": "claude-3", "role": "assistant"}}
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_responses_match_kinds(requests, responses)
+
+  def test_roots_valid(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ROOTS)}
+    responses = {"k": _LIST_ROOTS_RESULT}
+    validate_input_responses_match_kinds(requests, responses)
+
+  def test_roots_missing_roots_array_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ROOTS)}
+    responses = {"k": {"data": "oops"}}
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_responses_match_kinds(requests, responses)
+
+  def test_non_dict_response_raises(self):
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": "not-an-object"}
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_responses_match_kinds(requests, responses)
+
+  def test_extra_response_key_not_validated(self):
+    """Keys not in input_requests are skipped (caller should call validate_response_keys_match too)."""
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    responses = {"k": _ELICIT_RESULT_ACCEPT, "extra": "ignored"}
+    validate_input_responses_match_kinds(requests, responses)
+
+  def test_mismatch_error_has_json_rpc_code(self):
+    assert InputResponseKindMismatchError.json_rpc_code == -32600
+
+  def test_validate_input_response_for_kind_directly(self):
+    validate_input_response_for_kind("x", INPUT_REQUEST_ELICITATION, {"action": "accept"})
+    with pytest.raises(InputResponseKindMismatchError):
+      validate_input_response_for_kind("x", INPUT_REQUEST_ELICITATION, {"action": "bad"})
+
+
+# ---------------------------------------------------------------------------
+# AC-17.26 — Client errors on undeclared-but-recognized kind  (R-11.5-k)
+# ---------------------------------------------------------------------------
+
+class TestUndeclaredInputKind:
+  def test_declared_elicitation_passes(self):
+    meta = {"io.modelcontextprotocol/clientCapabilities": {"elicitation": {}}}
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    validate_client_can_fulfill_input_requests(meta, requests)
+
+  def test_undeclared_elicitation_raises(self):
+    """Even a recognized kind must be declared (R-11.5-k)."""
+    meta = {"io.modelcontextprotocol/clientCapabilities": {}}
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ELICITATION)}
+    with pytest.raises(UndeclaredInputKindError) as exc_info:
+      validate_client_can_fulfill_input_requests(meta, requests)
+    assert exc_info.value.kind == INPUT_REQUEST_ELICITATION
+
+  def test_undeclared_sampling_raises(self):
+    meta = {"io.modelcontextprotocol/clientCapabilities": {}}
+    requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
+    with pytest.raises(UndeclaredInputKindError) as exc_info:
+      validate_client_can_fulfill_input_requests(meta, requests)
+    assert exc_info.value.kind == INPUT_REQUEST_SAMPLING
+
+  def test_undeclared_roots_raises(self):
+    meta = {"io.modelcontextprotocol/clientCapabilities": {}}
+    requests = {"k": InputRequest(method=INPUT_REQUEST_ROOTS)}
+    with pytest.raises(UndeclaredInputKindError):
+      validate_client_can_fulfill_input_requests(meta, requests)
+
+  def test_one_undeclared_among_declared_raises(self):
+    """Even one undeclared kind in a multi-kind result causes an error."""
+    meta = {"io.modelcontextprotocol/clientCapabilities": {"elicitation": {}}}
+    requests = {
+      "k1": InputRequest(method=INPUT_REQUEST_ELICITATION),  # declared
+      "k2": InputRequest(method=INPUT_REQUEST_SAMPLING),     # NOT declared
+    }
+    with pytest.raises(UndeclaredInputKindError) as exc_info:
+      validate_client_can_fulfill_input_requests(meta, requests)
+    assert exc_info.value.kind == INPUT_REQUEST_SAMPLING
+
+  def test_undeclared_kind_error_has_json_rpc_code(self):
+    assert UndeclaredInputKindError.json_rpc_code == -32600
+
+  def test_distinct_from_unrecognized_kind_error(self):
+    """UndeclaredInputKindError and UnrecognizedInputRequestKindError are different."""
+    assert UndeclaredInputKindError is not UnrecognizedInputRequestKindError
+
+
+# ---------------------------------------------------------------------------
+# AC-17.30 — Malformed retry values rejected (R-11.5-s)
+# ---------------------------------------------------------------------------
+
+class TestMalformedRetryValues:
+  def test_null_input_response_value_raises(self):
+    """null is not a valid InputResponse shape (R-11.5-s)."""
+    with pytest.raises(MalformedInputRequiredResultError):
+      parse_input_response_params({
+        "_meta": {},
+        "inputResponses": {"k": None},
+      })
+
+  def test_string_input_response_value_raises(self):
+    with pytest.raises(MalformedInputRequiredResultError):
+      parse_input_response_params({
+        "_meta": {},
+        "inputResponses": {"k": "not-an-object"},
+      })
+
+  def test_number_input_response_value_raises(self):
+    with pytest.raises(MalformedInputRequiredResultError):
+      parse_input_response_params({
+        "_meta": {},
+        "inputResponses": {"k": 42},
+      })
+
+  def test_list_input_response_value_raises(self):
+    with pytest.raises(MalformedInputRequiredResultError):
+      parse_input_response_params({
+        "_meta": {},
+        "inputResponses": {"k": [1, 2, 3]},
+      })
+
+  def test_dict_input_response_value_passes(self):
+    """A dict is the required base shape for all InputResponse kinds."""
+    p = parse_input_response_params({
+      "_meta": {},
+      "inputResponses": {"k": {"action": "accept"}},
+    })
+    assert p.input_responses == {"k": {"action": "accept"}}
+
+  def test_malformed_error_code_is_32600(self):
+    """R-11.5-s: malformed retry → JSON-RPC error code -32600."""
+    assert MalformedInputRequiredResultError.json_rpc_code == -32600

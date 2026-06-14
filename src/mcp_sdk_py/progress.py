@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from mcp_sdk_py.jsonrpc import InFlightTracker, RequestId
 from mcp_sdk_py.result_error import validate_progress_token, ProgressToken
 
 
@@ -323,3 +324,101 @@ class ProgressTracker:
       for token, (_, is_complete) in self._active.items()
       if not is_complete
     )
+
+
+# ---------------------------------------------------------------------------
+# §15.1.2  Progress opt-in enforcement  [R-15.1.2-a, R-15.1.3-b/c]
+# ---------------------------------------------------------------------------
+
+class ProgressNotOptedInError(Exception):
+  """Raised when progress would be emitted for a request that did not opt in.
+
+  R-15.1.2-a: A request that omits progressToken from its _meta MUST NOT receive
+    any progress notifications. Progress is delivered only when the issuer opted in.
+  R-15.1.3-b/c: A progress notification MUST NOT reference a token not supplied
+    by the peer or not corresponding to an active in-progress request.
+  """
+
+
+def validate_progress_opt_in(
+  request_meta: dict[str, Any],
+  token: ProgressToken,
+) -> None:
+  """Assert that the request opted in to progress by placing token in _meta.
+
+  R-15.1.2-a: Progress MUST NOT be emitted when the request omitted progressToken.
+  R-15.1.3-b/c: The token MUST equal one supplied by the peer in an active request.
+
+  The bare "progressToken" key is the reserved opt-in sentinel (§15.1, §4.1).
+  Call this before registering a token in ProgressTracker to enforce opt-in.
+
+  Args:
+    request_meta: The _meta dict from the originating request params.
+    token: The ProgressToken the emitter intends to use.
+
+  Raises:
+    ProgressNotOptedInError: progressToken is absent from request_meta, or the
+      value in _meta does not match token.
+  """
+  actual = request_meta.get("progressToken")
+  if actual != token:
+    raise ProgressNotOptedInError(
+      f"Progress token {token!r} not found in request _meta.progressToken "
+      f"(found {actual!r}); progress MUST NOT be emitted when the request did "
+      f"not opt in (R-15.1.2-a, R-15.1.3-b, R-15.1.3-c)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# §15.2.1  Cancellation: in-flight guard  [R-15.2.1-a, R-15.2.1-b]
+# ---------------------------------------------------------------------------
+
+class CancellationTargetNotInFlightError(Exception):
+  """Raised when trying to cancel a request not tracked as in-flight by the sender.
+
+  R-15.2.1-a: requestId MUST correspond to a request the sender issued earlier
+    in the same direction and that the sender believes is still in-flight.
+  R-15.2.1-b: The cancellation MUST reference an in-flight request.
+
+  Callers should catch this and not emit the notification; they SHOULD NOT
+  return a JSON-RPC error to a remote party for this (it is a local guard).
+
+  json_rpc_code: -32600 (returned to callers that need an error code).
+  """
+
+  json_rpc_code: int = -32600
+
+  def __init__(self, request_id: RequestId) -> None:
+    super().__init__(
+      f"Request id {request_id!r} is not in the sender's in-flight set; "
+      f"cancellation MUST target only requests the sender issued and believes "
+      f"in-flight (R-15.2.1-a, R-15.2.1-b)"
+    )
+    self.request_id: RequestId = request_id
+
+
+def build_cancel_notification(
+  tracker: InFlightTracker,
+  request_id: RequestId,
+  reason: str | None = None,
+) -> CancelledNotificationParams:
+  """Build a CancelledNotificationParams only if request_id is in the sender's in-flight set.
+
+  R-15.2.1-a: requestId MUST correspond to a request the sender issued earlier
+    in the same direction and that the sender believes is still in-flight.
+  R-15.2.1-b: The cancellation MUST reference an in-flight request.
+
+  Args:
+    tracker: The sender's InFlightTracker (tracks ids of requests it issued).
+    request_id: The JSON-RPC id of the request to cancel.
+    reason: Optional human-readable explanation (R-15.2.1-c).
+
+  Returns:
+    CancelledNotificationParams ready to be sent.
+
+  Raises:
+    CancellationTargetNotInFlightError: request_id is not in tracker's in-flight set.
+  """
+  if not tracker.is_in_flight(request_id):
+    raise CancellationTargetNotInFlightError(request_id)
+  return CancelledNotificationParams(request_id=request_id, reason=reason)

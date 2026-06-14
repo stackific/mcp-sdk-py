@@ -1,6 +1,6 @@
 """Tests for S22 — Progress & Cancellation.
 
-Coverage map (26 ACs):
+Coverage map (26 story ACs + 2 conformance gaps):
   AC-22.1  → TestProgressMethodNames
   AC-22.2  → TestProgressNotificationParams
   AC-22.3  → TestProgressTokenValidation
@@ -27,6 +27,10 @@ Coverage map (26 ACs):
   AC-22.24 → TestProgressNumberTypes
   AC-22.25 → TestProgressTrackerReRegisterAfterComplete
   AC-22.26 → TestProgressTokenStringAndNumeric
+
+Conformance gap fixes (story AC numbers from S22 traceability table):
+  AC-22.5  (R-15.1.2-a)     → TestProgressOptIn
+  AC-22.18 (R-15.2.1-a/b)   → TestCancellationWithInFlightTracker
 """
 
 import pytest
@@ -36,12 +40,17 @@ from mcp_sdk_py.progress import (
   DISCOVER_METHOD,
   PROGRESS_NOTIFICATION_METHOD,
   CancelledNotificationParams,
+  CancellationTargetNotInFlightError,
   ProgressNotificationParams,
+  ProgressNotOptedInError,
   ProgressTracker,
+  build_cancel_notification,
   is_cancellable_method,
   validate_cancelled_notification_params,
   validate_progress_notification_params,
+  validate_progress_opt_in,
 )
+from mcp_sdk_py.jsonrpc import InFlightTracker
 
 
 # ---------------------------------------------------------------------------
@@ -581,3 +590,125 @@ class TestProgressTokenStringAndNumeric:
     tracker.register(1.5)
     tracker.emit(1.5, 10)
     assert tracker.is_active(1.5)
+
+
+# ===========================================================================
+# Conformance gap fixes
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# AC-22.5 — Progress opt-in: absent progressToken → no progress  (R-15.1.2-a)
+# ---------------------------------------------------------------------------
+
+class TestProgressOptIn:
+  def test_matching_token_passes(self):
+    """Token in _meta matches emitter's token → opt-in confirmed."""
+    meta = {"progressToken": "tok-abc"}
+    validate_progress_opt_in(meta, "tok-abc")
+
+  def test_absent_progress_token_raises(self):
+    """No progressToken in _meta → progress MUST NOT be emitted (R-15.1.2-a)."""
+    with pytest.raises(ProgressNotOptedInError):
+      validate_progress_opt_in({}, "tok-abc")
+
+  def test_mismatched_token_raises(self):
+    """_meta.progressToken != emitter's token → not the opted-in token."""
+    meta = {"progressToken": "tok-xyz"}
+    with pytest.raises(ProgressNotOptedInError):
+      validate_progress_opt_in(meta, "tok-abc")
+
+  def test_none_value_raises(self):
+    meta = {"progressToken": None}
+    with pytest.raises(ProgressNotOptedInError):
+      validate_progress_opt_in(meta, "tok-abc")
+
+  def test_integer_token_opt_in(self):
+    meta = {"progressToken": 42}
+    validate_progress_opt_in(meta, 42)
+
+  def test_integer_token_mismatch_raises(self):
+    meta = {"progressToken": 42}
+    with pytest.raises(ProgressNotOptedInError):
+      validate_progress_opt_in(meta, 43)
+
+  def test_opt_in_precedes_tracker_register(self):
+    """Typical usage: validate opt-in before registering in ProgressTracker."""
+    meta = {"progressToken": "t"}
+    validate_progress_opt_in(meta, "t")
+    tracker = ProgressTracker()
+    tracker.register("t")
+    assert tracker.is_active("t")
+
+  def test_no_opt_in_should_not_register(self):
+    """Without opt-in, progress should not be emitted — tracker is never touched."""
+    meta = {}  # no progressToken
+    with pytest.raises(ProgressNotOptedInError):
+      validate_progress_opt_in(meta, "t")
+    # ProgressTracker never gets a register call.
+    tracker = ProgressTracker()
+    assert not tracker.is_active("t")
+
+  def test_error_class(self):
+    assert issubclass(ProgressNotOptedInError, Exception)
+
+
+# ---------------------------------------------------------------------------
+# AC-22.18 — Cancellation targets only self-issued in-flight requests (R-15.2.1-a/b)
+# ---------------------------------------------------------------------------
+
+class TestCancellationWithInFlightTracker:
+  def _tracker_with(self, *ids) -> InFlightTracker:
+    tracker = InFlightTracker()
+    for rid in ids:
+      tracker.send(rid)
+    return tracker
+
+  def test_in_flight_request_can_be_cancelled(self):
+    """build_cancel_notification succeeds for an in-flight id."""
+    tracker = self._tracker_with("req-1")
+    note = build_cancel_notification(tracker, "req-1", reason="user cancelled")
+    assert note.request_id == "req-1"
+    assert note.reason == "user cancelled"
+
+  def test_not_in_flight_raises(self):
+    """Attempting to cancel a non-in-flight id raises (R-15.2.1-a/b)."""
+    tracker = InFlightTracker()
+    with pytest.raises(CancellationTargetNotInFlightError) as exc_info:
+      build_cancel_notification(tracker, "req-1")
+    assert exc_info.value.request_id == "req-1"
+
+  def test_completed_request_not_cancellable(self):
+    """After receiving a response, the id leaves in-flight → cannot be cancelled."""
+    tracker = self._tracker_with("req-2")
+    tracker.receive("req-2")
+    with pytest.raises(CancellationTargetNotInFlightError):
+      build_cancel_notification(tracker, "req-2")
+
+  def test_cancellation_without_reason(self):
+    """reason is optional (R-15.2.1-c)."""
+    tracker = self._tracker_with("req-3")
+    note = build_cancel_notification(tracker, "req-3")
+    assert note.request_id == "req-3"
+    assert note.reason is None
+
+  def test_cancellation_error_carries_request_id(self):
+    tracker = InFlightTracker()
+    try:
+      build_cancel_notification(tracker, "bad-id")
+    except CancellationTargetNotInFlightError as e:
+      assert e.request_id == "bad-id"
+
+  def test_error_has_json_rpc_code(self):
+    assert CancellationTargetNotInFlightError.json_rpc_code == -32600
+
+  def test_multiple_in_flight_only_target_specific(self):
+    """Only the targeted id needs to be in-flight."""
+    tracker = self._tracker_with("a", "b", "c")
+    note = build_cancel_notification(tracker, "b")
+    assert note.request_id == "b"
+
+  def test_integer_request_id_in_flight(self):
+    tracker = InFlightTracker()
+    tracker.send(99)
+    note = build_cancel_notification(tracker, 99)
+    assert note.request_id == 99
