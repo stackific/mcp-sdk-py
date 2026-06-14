@@ -754,7 +754,7 @@ class TestResultTypeClassificationConstants:
 # ---------------------------------------------------------------------------
 
 _ELICIT_RESULT_ACCEPT = {"action": "accept"}
-_CREATE_MSG_RESULT = {"model": "claude-3", "role": "assistant", "content": {"type": "text", "text": "hi"}}
+_CREATE_MSG_RESULT = {"model": "vendor-model-3", "role": "assistant", "content": {"type": "text", "text": "hi"}}
 _LIST_ROOTS_RESULT = {"roots": [{"uri": "file:///home", "name": "home"}]}
 
 
@@ -845,7 +845,7 @@ class TestInputResponseKindMatching:
 
   def test_sampling_wrong_role_raises(self):
     requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
-    responses = {"k": {"model": "gpt-4", "role": "user", "content": {}}}
+    responses = {"k": {"model": "vendor-model-4", "role": "user", "content": {}}}
     with pytest.raises(InputResponseKindMismatchError):
       validate_input_responses_match_kinds(requests, responses)
 
@@ -857,7 +857,7 @@ class TestInputResponseKindMatching:
 
   def test_sampling_missing_content_raises(self):
     requests = {"k": InputRequest(method=INPUT_REQUEST_SAMPLING)}
-    responses = {"k": {"model": "claude-3", "role": "assistant"}}
+    responses = {"k": {"model": "vendor-model-3", "role": "assistant"}}
     with pytest.raises(InputResponseKindMismatchError):
       validate_input_responses_match_kinds(requests, responses)
 
