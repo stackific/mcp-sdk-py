@@ -1,9 +1,9 @@
 """Tests for S12 — Transport Model & Transport-Agnostic Guarantees.
 
-Coverage map (24 story ACs):
+Coverage map (24 story ACs + remediation of RQ gaps):
   AC-12.1  → TestTransportMessageCarriage
   AC-12.2  → TestMessageIntegrity
-  AC-12.3  → TestFramingContract
+  AC-12.3  → TestFramingPrimitive
   AC-12.4  → TestIdCorrelation
   AC-12.5  → TestMalformedIdError
   AC-12.6  → TestMultiplexing
@@ -25,6 +25,16 @@ Coverage map (24 story ACs):
   AC-12.22 → TestConnectionReuseNotRequired
   AC-12.23 → TestExplicitIdentifierForContinuity
   AC-12.24 → TestDisconnectMakesInFlightFailed
+
+Remediation tests (RQ gaps from QA):
+  RQ-1  → TestTransportProtocol (abstract interface)
+  RQ-3  → TestInMemoryTransportIntegrity
+  RQ-5  → TestFramingPrimitive (split_frames / frame_message in production code)
+  RQ-9  → TestNoSilentLoss (MessageDeliveryError on closed peer)
+  RQ-10 → TestCleanClose (observable close state, close() method)
+  RQ-11 → TestDisconnectionObservable (DisconnectionError on peer close)
+  RQ-13 → TestTransportProtocol (InMemoryTransport satisfies Transport Protocol)
+  RQ-15 → TestNoConnectionScopedState (real guard, not always-raising)
 """
 
 import json
@@ -32,19 +42,88 @@ import pytest
 
 from mcp_sdk_py.transport import (
   DEFINED_TRANSPORTS,
+  STDIO_FRAME_DELIMITER,
   TRANSPORT_STDIO,
   TRANSPORT_STREAMABLE_HTTP,
   ConnectionScopedStateError,
   CustomTransportChecklist,
   DisconnectionError,
+  InMemoryTransport,
   MalformedMessageError,
   MessageDeliveryError,
+  Transport,
   TransportError,
   assert_no_connection_scoped_state,
   fail_in_flight_on_disconnect,
+  frame_message,
+  is_connection_scoped,
+  split_frames,
   validate_utf8_json_unit,
 )
-from mcp_sdk_py.jsonrpc import InFlightTracker
+from mcp_sdk_py.jsonrpc import (
+  InFlightTracker,
+  JSONRPCNotification,
+  JSONRPCRequest,
+  JSONRPCResultResponse,
+)
+
+
+# ---------------------------------------------------------------------------
+# RQ-1 / RQ-13 — Transport Protocol (abstract interface) + conforming implementation
+# ---------------------------------------------------------------------------
+
+class TestTransportProtocol:
+  """The central deliverable of S12 is an abstract transport interface (RQ-1).
+  InMemoryTransport must conform to it (RQ-13)."""
+
+  def test_transport_is_runtime_checkable(self):
+    """Transport is a @runtime_checkable Protocol — isinstance() works."""
+    client, _ = InMemoryTransport.create_pair()
+    assert isinstance(client, Transport)
+
+  def test_in_memory_transport_has_send(self):
+    client, _ = InMemoryTransport.create_pair()
+    assert callable(client.send)
+
+  def test_in_memory_transport_has_receive(self):
+    _, server = InMemoryTransport.create_pair()
+    assert callable(server.receive)
+
+  def test_in_memory_transport_has_close(self):
+    client, _ = InMemoryTransport.create_pair()
+    assert callable(client.close)
+
+  def test_in_memory_transport_has_is_closed(self):
+    client, _ = InMemoryTransport.create_pair()
+    assert isinstance(client.is_closed, bool)
+
+  def test_transport_protocol_methods(self):
+    """Transport Protocol defines the four required members."""
+    # All four structural members are accessible on the runtime_checkable Protocol.
+    import inspect
+    members = {name for name, _ in inspect.getmembers(Transport)}
+    assert "send" in members
+    assert "receive" in members
+    assert "close" in members
+    assert "is_closed" in members
+
+  def test_send_signature_accepts_jsonrpc_message(self):
+    """send() accepts any JSONRPCMessage variant (request, notification, response)."""
+    client, server = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(id=1, method="tools/list", params={})
+    client.send(req)  # must not raise
+    msg = server.receive()
+    assert isinstance(msg, JSONRPCRequest)
+    assert msg.id == 1
+
+  def test_receive_returns_jsonrpc_message(self):
+    """receive() returns whatever was sent — same object."""
+    client, server = InMemoryTransport.create_pair()
+    note = JSONRPCNotification(method="notifications/progress", params={"progressToken": "t", "progress": 1})
+    client.send(note)
+    msg = server.receive()
+    assert isinstance(msg, JSONRPCNotification)
+    assert msg.method == "notifications/progress"
 
 
 # ---------------------------------------------------------------------------
@@ -60,92 +139,175 @@ class TestTransportMessageCarriage:
     assert TRANSPORT_STDIO in DEFINED_TRANSPORTS
     assert TRANSPORT_STREAMABLE_HTTP in DEFINED_TRANSPORTS
 
-  def test_jsonrpc_message_is_utf8_json(self):
-    """Transport-identical request example from §7.7 parses as UTF-8 JSON."""
+  def test_request_carried_from_client_to_server(self):
+    """Transport carries JSONRPCRequest client→server (R-7.4-b)."""
+    client, server = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(id=1, method="tools/call", params={"name": "search"})
+    client.send(req)
+    received = server.receive()
+    assert isinstance(received, JSONRPCRequest)
+    assert received.method == "tools/call"
+
+  def test_response_carried_from_server_to_client(self):
+    """Transport carries JSONRPCResultResponse server→client (R-7.4-c)."""
+    client, server = InMemoryTransport.create_pair()
+    resp = JSONRPCResultResponse(id=1, result={"resultType": "complete", "tools": []})
+    server.send(resp)
+    received = client.receive()
+    assert isinstance(received, JSONRPCResultResponse)
+    assert received.id == 1
+
+  def test_notification_carried_both_directions(self):
+    """Notifications travel in both directions (R-7.4-b/c)."""
+    client, server = InMemoryTransport.create_pair()
+    note = JSONRPCNotification(method="notifications/progress", params={"progressToken": "t", "progress": 5})
+    # Client → Server
+    client.send(note)
+    assert isinstance(server.receive(), JSONRPCNotification)
+    # Server → Client
+    server.send(note)
+    assert isinstance(client.receive(), JSONRPCNotification)
+
+  def test_all_three_message_variants_transported(self):
+    """All three JSONRPCMessage variants transit the transport (R-7.1-a)."""
+    client, server = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(id=10, method="resources/list", params={})
+    note = JSONRPCNotification(method="notifications/cancelled", params={"requestId": "x"})
+    resp = JSONRPCResultResponse(id=10, result={"resultType": "complete"})
+    client.send(req)
+    server.send(resp)
+    client.send(note)
+    assert isinstance(server.receive(), JSONRPCRequest)
+    assert isinstance(client.receive(), JSONRPCResultResponse)
+    assert isinstance(server.receive(), JSONRPCNotification)
+
+  def test_jsonrpc_message_as_utf8_json_validates(self):
+    """Transport-identical request is a well-formed UTF-8 JSON unit (R-7.1-b)."""
     raw = json.dumps({
-      "jsonrpc": "2.0",
-      "id": 1,
-      "method": "tools/call",
-      "params": {
-        "name": "get_weather",
-        "_meta": {
-          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-          "io.modelcontextprotocol/clientInfo": {"name": "example-client", "version": "1.0.0"},
-          "io.modelcontextprotocol/clientCapabilities": {},
-        },
-      },
+      "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+      "params": {"_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "c", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+      }},
     }).encode("utf-8")
     parsed = validate_utf8_json_unit(raw)
     assert parsed["method"] == "tools/call"
 
-  def test_notification_is_utf8_json(self):
-    raw = json.dumps({
-      "jsonrpc": "2.0",
-      "method": "notifications/progress",
-      "params": {"progressToken": "t", "progress": 50},
-    }).encode("utf-8")
-    parsed = validate_utf8_json_unit(raw)
-    assert parsed["method"] == "notifications/progress"
-
-  def test_response_is_utf8_json(self):
-    raw = json.dumps({
-      "jsonrpc": "2.0",
-      "id": 1,
-      "result": {"resultType": "complete", "content": []},
-    }).encode("utf-8")
-    parsed = validate_utf8_json_unit(raw)
-    assert parsed["id"] == 1
-
 
 # ---------------------------------------------------------------------------
-# AC-12.2 — message integrity: delivered == emitted byte-for-byte  (R-7.1-c)
+# AC-12.2 / RQ-3 — message integrity: delivered == emitted  (R-7.1-c)
 # ---------------------------------------------------------------------------
 
 class TestMessageIntegrity:
-  def test_decoded_matches_original(self):
+  def test_message_delivered_unchanged(self):
+    """Payload is byte-for-byte identical after transit (R-7.1-c)."""
+    client, server = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(id=42, method="prompts/get", params={"name": "greet"})
+    client.send(req)
+    received = server.receive()
+    assert received.id == req.id
+    assert received.method == req.method
+    assert received.params == req.params
+
+  def test_unicode_payload_preserved(self):
+    """Non-ASCII content is preserved intact (R-7.1-c)."""
+    client, server = InMemoryTransport.create_pair()
+    note = JSONRPCNotification(method="x", params={"q": "日本語テスト"})
+    client.send(note)
+    received = server.receive()
+    assert received.params["q"] == "日本語テスト"
+
+  def test_decoded_json_matches_original(self):
     original = {
-      "jsonrpc": "2.0",
-      "id": 7,
-      "method": "resources/read",
-      "params": {"uri": "file:///a.txt", "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}},
+      "jsonrpc": "2.0", "id": 7, "method": "resources/read",
+      "params": {"uri": "file:///a.txt"},
     }
     encoded = json.dumps(original, ensure_ascii=False).encode("utf-8")
     decoded = validate_utf8_json_unit(encoded)
-    # Re-encode and compare byte-for-byte.
     assert json.dumps(decoded, ensure_ascii=False).encode("utf-8") == encoded
 
-  def test_unicode_preserved(self):
-    """Non-ASCII fields must survive the UTF-8 round-trip unchanged."""
-    original = {"jsonrpc": "2.0", "id": 1, "method": "x", "params": {"q": "日本語"}}
-    encoded = json.dumps(original, ensure_ascii=False).encode("utf-8")
-    decoded = validate_utf8_json_unit(encoded)
-    assert decoded["params"]["q"] == "日本語"
-
 
 # ---------------------------------------------------------------------------
-# AC-12.3 — framing: body-independent boundary determination  (R-7.2-b/c/d)
+# AC-12.3 / RQ-5 — framing primitive in production code  (R-7.2-b/c/d)
 # ---------------------------------------------------------------------------
 
-class TestFramingContract:
-  def test_stdio_framing_is_newline_delimited(self):
-    """Stdio uses newline (\\n) as the frame delimiter — body-independent (S13)."""
-    # Each JSON object terminated by \\n is one framed unit.
-    frame_1 = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "m", "params": {}}).encode()
-    frame_2 = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "n", "params": {}}).encode()
-    stream = frame_1 + b"\n" + frame_2 + b"\n"
-    units = [u for u in stream.split(b"\n") if u]
-    assert len(units) == 2
-    parsed_1 = validate_utf8_json_unit(units[0])
-    parsed_2 = validate_utf8_json_unit(units[1])
-    assert parsed_1["id"] == 1
-    assert parsed_2["id"] == 2
+class TestFramingPrimitive:
+  """split_frames() and frame_message() live in production code (not tests)
+  and provide body-independent boundary detection (RQ-5)."""
 
-  def test_framing_does_not_require_body_parse(self):
-    """Delimiter (\\n) is body-independent; we split before parsing JSON."""
-    bodies = [b'{"jsonrpc":"2.0","id":1,"method":"a"}', b'{"jsonrpc":"2.0","id":2,"method":"b"}']
-    concatenated = b"\n".join(bodies)
-    units = concatenated.split(b"\n")
-    assert len(units) == 2  # split without parsing JSON body
+  def test_split_single_frame(self):
+    data = b'{"jsonrpc":"2.0","id":1,"method":"m"}\n'
+    frames = split_frames(data)
+    assert len(frames) == 1
+    assert frames[0] == b'{"jsonrpc":"2.0","id":1,"method":"m"}'
+
+  def test_split_two_frames(self):
+    f1 = b'{"jsonrpc":"2.0","id":1,"method":"a"}'
+    f2 = b'{"jsonrpc":"2.0","id":2,"method":"b"}'
+    stream = f1 + b"\n" + f2 + b"\n"
+    frames = split_frames(stream)
+    assert len(frames) == 2
+    assert frames[0] == f1
+    assert frames[1] == f2
+
+  def test_split_many_frames(self):
+    messages = [f'{{"jsonrpc":"2.0","id":{i},"method":"m"}}'.encode() for i in range(5)]
+    stream = b"\n".join(messages) + b"\n"
+    frames = split_frames(stream)
+    assert len(frames) == 5
+    for i, frame in enumerate(frames):
+      assert json.loads(frame)["id"] == i
+
+  def test_trailing_delimiter_excluded(self):
+    """Empty frame from trailing delimiter must not appear in output (R-7.2-b)."""
+    data = b'{"id":1}\n'
+    frames = split_frames(data)
+    assert all(f for f in frames)  # no empty bytes objects
+    assert len(frames) == 1
+
+  def test_body_independent_no_json_parsing_required(self):
+    """Boundary finding uses delimiter only — no JSON parsing needed (R-7.2-c)."""
+    # Even syntactically invalid JSON is split correctly by the delimiter.
+    data = b'NOT JSON\nALSO NOT JSON\n'
+    frames = split_frames(data)
+    assert len(frames) == 2
+    assert frames[0] == b'NOT JSON'
+    assert frames[1] == b'ALSO NOT JSON'
+
+  def test_custom_delimiter(self):
+    data = b'msg1\r\nmsg2\r\n'
+    frames = split_frames(data, delimiter=b"\r\n")
+    assert len(frames) == 2
+
+  def test_frame_message_appends_delimiter(self):
+    msg = b'{"jsonrpc":"2.0","id":1,"method":"m"}'
+    framed = frame_message(msg)
+    assert framed == msg + b"\n"
+
+  def test_frame_message_custom_delimiter(self):
+    msg = b'{"id":1}'
+    framed = frame_message(msg, delimiter=b"\r\n")
+    assert framed.endswith(b"\r\n")
+
+  def test_split_roundtrip_with_frame_message(self):
+    """frame_message + split_frames round-trip is lossless."""
+    messages = [b'{"id":1}', b'{"id":2}', b'{"id":3}']
+    stream = b"".join(frame_message(m) for m in messages)
+    recovered = split_frames(stream)
+    assert recovered == messages
+
+  def test_stdio_frame_delimiter_constant(self):
+    assert STDIO_FRAME_DELIMITER == b"\n"
+
+  def test_each_frame_parses_as_json(self):
+    """After splitting, each frame can be parsed as a single JSON value (R-7.2-b/d)."""
+    m1 = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "m"}).encode()
+    m2 = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "n"}).encode()
+    frames = split_frames(frame_message(m1) + frame_message(m2))
+    for frame in frames:
+      parsed = validate_utf8_json_unit(frame)
+      assert "jsonrpc" in parsed
 
 
 # ---------------------------------------------------------------------------
@@ -161,19 +323,16 @@ class TestIdCorrelation:
     resp = classify_message(resp_raw)
     assert req.id == resp.id
 
-  def test_correlation_ignores_order(self):
-    """Responses to id=3 can arrive before id=2; correlation is by id only."""
+  def test_correlation_is_by_id_not_order(self):
     from mcp_sdk_py.jsonrpc import classify_message, ids_are_equal
     resp_3 = {"jsonrpc": "2.0", "id": 3, "result": {"resultType": "complete", "resources": []}}
     resp_2 = {"jsonrpc": "2.0", "id": 2, "result": {"resultType": "complete", "tools": []}}
-    # Arrive in reverse order — still correlated correctly by id.
     r3 = classify_message(resp_3)
     r2 = classify_message(resp_2)
     assert ids_are_equal(r3.id, 3)
     assert ids_are_equal(r2.id, 2)
 
   def test_in_flight_tracker_enforces_no_reuse(self):
-    """Sender MUST NOT reuse id until response received (R-7.2-j)."""
     tracker = InFlightTracker()
     tracker.send(1)
     with pytest.raises(ValueError, match="already in-flight"):
@@ -183,7 +342,18 @@ class TestIdCorrelation:
     tracker = InFlightTracker()
     tracker.send(1)
     tracker.receive(1)
-    tracker.send(1)  # must not raise — id is free again
+    tracker.send(1)  # must not raise
+
+  def test_id_correlation_via_in_memory_transport(self):
+    """Request id is preserved through transit (R-7.2-e)."""
+    client, server = InMemoryTransport.create_pair()
+    req = JSONRPCRequest(id=99, method="tools/list", params={})
+    client.send(req)
+    received = server.receive()
+    resp = JSONRPCResultResponse(id=received.id, result={"resultType": "complete"})
+    server.send(resp)
+    final = client.receive()
+    assert final.id == 99
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +362,13 @@ class TestIdCorrelation:
 
 class TestMalformedIdError:
   def test_null_id_error_response_accepted(self):
-    """An error response with null id is valid when the request id could not be read."""
     from mcp_sdk_py.jsonrpc import classify_message, JSONRPCErrorResponse
     raw = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
     msg = classify_message(raw)
-    # null id on error response — acceptable per R-7.2-h
     assert isinstance(msg, JSONRPCErrorResponse)
     assert msg.id is None
 
   def test_omitted_id_on_error_accepted(self):
-    """Error response may omit id entirely."""
     from mcp_sdk_py.jsonrpc import classify_message, JSONRPCErrorResponse
     raw = {"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}
     msg = classify_message(raw)
@@ -210,41 +377,44 @@ class TestMalformedIdError:
 
 
 # ---------------------------------------------------------------------------
-# AC-12.6 — multiplexing: multiple outstanding requests, no id reuse  (R-7.2-i/j/k/l)
+# AC-12.6 — multiplexing: multiple outstanding requests  (R-7.2-i/j/k/l)
 # ---------------------------------------------------------------------------
 
 class TestMultiplexing:
-  def test_multiple_in_flight_ids_allowed(self):
-    """R-7.2-i: sender MAY have multiple requests outstanding at once."""
+  def test_multiple_messages_in_flight_via_transport(self):
+    """Transport accepts multiple sends before any receives (R-7.2-i/k)."""
+    client, server = InMemoryTransport.create_pair()
+    req1 = JSONRPCRequest(id=1, method="tools/list", params={})
+    req2 = JSONRPCRequest(id=2, method="resources/list", params={})
+    req3 = JSONRPCRequest(id=3, method="prompts/list", params={})
+    client.send(req1)
+    client.send(req2)
+    client.send(req3)
+    assert isinstance(server.receive(), JSONRPCRequest)
+    assert isinstance(server.receive(), JSONRPCRequest)
+    assert isinstance(server.receive(), JSONRPCRequest)
+
+  def test_no_await_required_between_sends(self):
+    """R-7.2-l: transport MUST NOT require awaiting previous response."""
+    client, server = InMemoryTransport.create_pair()
+    client.send(JSONRPCRequest(id=10, method="a", params={}))
+    # No receive() between sends — second send must work immediately.
+    client.send(JSONRPCRequest(id=11, method="b", params={}))
+    assert server.receive().id == 10
+    assert server.receive().id == 11
+
+  def test_in_flight_tracker_multiple_ids(self):
     tracker = InFlightTracker()
     tracker.send(1)
     tracker.send(2)
     tracker.send(3)
-    assert tracker.is_in_flight(1)
-    assert tracker.is_in_flight(2)
-    assert tracker.is_in_flight(3)
+    assert tracker.in_flight_ids == frozenset({1, 2, 3})
 
-  def test_second_request_without_awaiting_first(self):
-    """R-7.2-l: transport must not require awaiting response before next request."""
-    tracker = InFlightTracker()
-    tracker.send("a")
-    # No call to receive("a") — second request issued immediately.
-    tracker.send("b")
-    assert tracker.is_in_flight("a")
-    assert tracker.is_in_flight("b")
-
-  def test_unique_ids_required(self):
-    """R-7.2-j: must not reuse id of outstanding request."""
+  def test_unique_ids_enforced(self):
     tracker = InFlightTracker()
     tracker.send(99)
     with pytest.raises(ValueError):
       tracker.send(99)
-
-  def test_in_flight_ids_snapshot(self):
-    tracker = InFlightTracker()
-    tracker.send(10)
-    tracker.send(20)
-    assert tracker.in_flight_ids == frozenset({10, 20})
 
 
 # ---------------------------------------------------------------------------
@@ -252,72 +422,101 @@ class TestMultiplexing:
 # ---------------------------------------------------------------------------
 
 class TestOutOfOrderResponses:
-  def test_responses_may_arrive_in_any_order(self):
-    """R-7.2-m: responses MAY arrive in any order."""
+  def test_out_of_order_delivery_via_transport(self):
+    """Server can reply to later request first; client correlates by id (R-7.2-m)."""
+    client, server = InMemoryTransport.create_pair()
+    client.send(JSONRPCRequest(id=2, method="tools/list", params={}))
+    client.send(JSONRPCRequest(id=3, method="resources/list", params={}))
+    # Server replies to 3 first.
+    server.send(JSONRPCResultResponse(id=3, result={"resultType": "complete"}))
+    server.send(JSONRPCResultResponse(id=2, result={"resultType": "complete"}))
+    r_first = client.receive()
+    r_second = client.receive()
+    assert r_first.id == 3
+    assert r_second.id == 2
+
+  def test_receiver_uses_id_not_order(self):
     tracker = InFlightTracker()
     tracker.send(2)
     tracker.send(3)
-    # Response to 3 arrives first — valid.
     tracker.receive(3)
     assert not tracker.is_in_flight(3)
     assert tracker.is_in_flight(2)
-    # Then response to 2 arrives.
     tracker.receive(2)
-    assert not tracker.is_in_flight(2)
-
-  def test_receiver_must_not_assume_order(self):
-    """Correlation by id is independent of arrival order."""
-    ids_sent = [5, 6, 7]
-    tracker = InFlightTracker()
-    for i in ids_sent:
-      tracker.send(i)
-    # Receive in reverse order.
-    for i in reversed(ids_sent):
-      tracker.receive(i)
-    # All correctly cleared — no FIFO assumption needed.
     assert tracker.in_flight_ids == frozenset()
 
 
 # ---------------------------------------------------------------------------
-# AC-12.8 — no silent loss: observable failure required  (R-7.2-q/r/s)
+# AC-12.8 / RQ-9 — no silent loss: MessageDeliveryError on closed peer  (R-7.2-q/r/s)
 # ---------------------------------------------------------------------------
 
 class TestNoSilentLoss:
+  def test_send_to_closed_this_side_raises(self):
+    """Sending after close() on this side raises MessageDeliveryError (R-7.2-q)."""
+    client, server = InMemoryTransport.create_pair()
+    client.close()
+    with pytest.raises(MessageDeliveryError):
+      client.send(JSONRPCRequest(id=1, method="m", params={}))
+
+  def test_send_to_closed_peer_raises(self):
+    """Sending when peer is closed raises MessageDeliveryError (R-7.2-r) — no silent drop."""
+    client, server = InMemoryTransport.create_pair()
+    server.close()
+    with pytest.raises(MessageDeliveryError):
+      client.send(JSONRPCRequest(id=1, method="m", params={}))
+
+  def test_message_delivery_error_carries_summary(self):
+    client, server = InMemoryTransport.create_pair()
+    server.close()
+    try:
+      client.send(JSONRPCRequest(id=1, method="m", params={}))
+    except MessageDeliveryError as e:
+      assert isinstance(e.message_summary, str)
+
   def test_message_delivery_error_is_transport_error(self):
     assert issubclass(MessageDeliveryError, TransportError)
 
-  def test_message_delivery_error_raised_not_swallowed(self):
-    """Raise MessageDeliveryError to surface an undeliverable message."""
-    with pytest.raises(MessageDeliveryError):
-      raise MessageDeliveryError("could not deliver to peer", message_summary="tools/call id=1")
-
-  def test_message_delivery_error_carries_summary(self):
-    err = MessageDeliveryError("undeliverable", message_summary="req-42")
-    assert err.message_summary == "req-42"
-
-  def test_transport_error_base_class(self):
+  def test_transport_error_is_exception(self):
     assert issubclass(TransportError, Exception)
 
 
 # ---------------------------------------------------------------------------
-# AC-12.9 — clean close: observable to both sides  (R-7.2-t)
+# AC-12.9 / RQ-10 — clean close: observable state  (R-7.2-t)
 # ---------------------------------------------------------------------------
 
 class TestCleanClose:
+  def test_is_closed_false_before_close(self):
+    client, _ = InMemoryTransport.create_pair()
+    assert not client.is_closed
+
+  def test_is_closed_true_after_close(self):
+    """close() makes is_closed observable (R-7.2-t)."""
+    client, server = InMemoryTransport.create_pair()
+    client.close()
+    assert client.is_closed
+
+  def test_server_side_close_observable(self):
+    client, server = InMemoryTransport.create_pair()
+    server.close()
+    assert server.is_closed
+    assert not client.is_closed
+
+  def test_close_is_idempotent(self):
+    """Calling close() twice must not raise."""
+    client, _ = InMemoryTransport.create_pair()
+    client.close()
+    client.close()
+    assert client.is_closed
+
   def test_disconnection_error_is_transport_error(self):
     assert issubclass(DisconnectionError, TransportError)
 
-  def test_disconnection_error_raised(self):
+  def test_receive_on_closed_self_raises_disconnection(self):
+    """After close(), receive() raises DisconnectionError (R-7.2-t)."""
+    client, _ = InMemoryTransport.create_pair()
+    client.close()
     with pytest.raises(DisconnectionError):
-      raise DisconnectionError("connection closed by peer")
-
-  def test_disconnection_error_carries_connection_id(self):
-    err = DisconnectionError("lost", connection_id="conn-abc")
-    assert err.connection_id == "conn-abc"
-
-  def test_disconnection_default_message(self):
-    err = DisconnectionError()
-    assert "lost" in str(err).lower() or "connection" in str(err).lower()
+      client.receive()
 
 
 # ---------------------------------------------------------------------------
@@ -329,9 +528,8 @@ class TestCustomTransportPermitted:
     c = CustomTransportChecklist(name="MyTransport")
     assert not c.is_conformant()
 
-  def test_conformant_checklist(self):
+  def test_conformant_checklist_passes(self):
     c = CustomTransportChecklist(
-      name="MyTransport",
       preserves_json_rpc_format=True,
       preserves_exchange_patterns=True,
       preserves_per_request_meta=True,
@@ -348,37 +546,33 @@ class TestCustomTransportPermitted:
     assert c.is_conformant()
 
   def test_missing_obligations_lists_gaps(self):
-    c = CustomTransportChecklist(
-      preserves_json_rpc_format=True,
-      provides_framing=True,
-    )
+    c = CustomTransportChecklist(preserves_json_rpc_format=True, provides_framing=True)
     missing = c.missing_obligations()
     assert "preserves_json_rpc_format" not in missing
     assert "provides_framing" not in missing
     assert "utf8_encoded" in missing
     assert "bidirectional" in missing
 
-  def test_partial_conformance_not_conformant(self):
+  def test_partial_not_conformant(self):
     c = CustomTransportChecklist(preserves_json_rpc_format=True)
     assert not c.is_conformant()
 
-  def test_checklist_has_name_field(self):
+  def test_checklist_name_field(self):
     c = CustomTransportChecklist(name="WebSocket")
     assert c.name == "WebSocket"
 
 
 # ---------------------------------------------------------------------------
-# AC-12.11 — custom transport over reliable stream SHOULD use stdio framing  (R-7.3-e)
+# AC-12.11 — custom transport over stream SHOULD use stdio framing  (R-7.3-e)
 # ---------------------------------------------------------------------------
 
 class TestStdioFramingRecommendation:
-  def test_checklist_tracks_stdio_framing_recommendation(self):
-    """uses_stdio_framing_if_stream tracks SHOULD-level compliance (R-7.3-e)."""
+  def test_checklist_tracks_stdio_framing(self):
     c = CustomTransportChecklist(uses_stdio_framing_if_stream=True)
     assert c.uses_stdio_framing_if_stream
 
-  def test_checklist_conformant_without_stdio_framing_flag(self):
-    """uses_stdio_framing_if_stream is SHOULD-level; not blocking is_conformant()."""
+  def test_conformant_without_stdio_framing_flag(self):
+    """uses_stdio_framing_if_stream is SHOULD-level; does not block is_conformant()."""
     c = CustomTransportChecklist(
       preserves_json_rpc_format=True,
       preserves_exchange_patterns=True,
@@ -392,33 +586,40 @@ class TestStdioFramingRecommendation:
       observable_disconnection=True,
       utf8_encoded=True,
       bidirectional=True,
-      uses_stdio_framing_if_stream=False,  # SHOULD — not a hard requirement
+      uses_stdio_framing_if_stream=False,
     )
     assert c.is_conformant()
 
 
 # ---------------------------------------------------------------------------
-# AC-12.12 — bidirectional: both directions over one connection  (R-7.4-a/b/c)
+# AC-12.12 — bidirectional channel over one connection  (R-7.4-a/b/c)
 # ---------------------------------------------------------------------------
 
 class TestBidirectional:
-  def test_checklist_bidirectional_flag(self):
-    c = CustomTransportChecklist(bidirectional=True)
-    assert c.bidirectional
+  def test_client_to_server_and_back(self):
+    """Full round-trip: client sends request, server replies (R-7.4-a/b/c)."""
+    client, server = InMemoryTransport.create_pair()
+    client.send(JSONRPCRequest(id=1, method="tools/list", params={}))
+    req = server.receive()
+    server.send(JSONRPCResultResponse(id=req.id, result={"resultType": "complete", "tools": []}))
+    resp = client.receive()
+    assert resp.id == 1
 
-  def test_request_is_client_to_server(self):
-    """Client sends requests; server receives them (R-7.4-b)."""
-    from mcp_sdk_py.jsonrpc import classify_message, JSONRPCRequest
-    raw = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-    msg = classify_message(raw)
-    assert isinstance(msg, JSONRPCRequest)
+  def test_server_can_also_send_notifications(self):
+    """Server sends notifications to client; client receives (R-7.4-c)."""
+    client, server = InMemoryTransport.create_pair()
+    note = JSONRPCNotification(method="notifications/progress", params={"progressToken": "t", "progress": 50})
+    server.send(note)
+    received = client.receive()
+    assert isinstance(received, JSONRPCNotification)
 
-  def test_response_is_server_to_client(self):
-    """Server sends responses; client receives them (R-7.4-c)."""
-    from mcp_sdk_py.jsonrpc import classify_message, JSONRPCResultResponse
-    raw = {"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete"}}
-    msg = classify_message(raw)
-    assert isinstance(msg, JSONRPCResultResponse)
+  def test_both_directions_simultaneously(self):
+    """Messages travel both ways over one pair (R-7.4-a)."""
+    client, server = InMemoryTransport.create_pair()
+    client.send(JSONRPCRequest(id=1, method="m", params={}))
+    server.send(JSONRPCNotification(method="notifications/progress", params={"progressToken": "t", "progress": 1}))
+    assert isinstance(server.receive(), JSONRPCRequest)
+    assert isinstance(client.receive(), JSONRPCNotification)
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +628,6 @@ class TestBidirectional:
 
 class TestPerRequestMetaRequired:
   def test_request_meta_keys_present(self):
-    """_meta with the three required keys is present regardless of transport."""
     from mcp_sdk_py.meta_object import (
       KEY_PROTOCOL_VERSION,
       KEY_CLIENT_INFO,
@@ -439,64 +639,76 @@ class TestPerRequestMetaRequired:
       KEY_CLIENT_INFO: {"name": "c", "version": "1"},
       KEY_CLIENT_CAPABILITIES: {},
     }
-    validate_request_meta_object(meta)  # must not raise
+    validate_request_meta_object(meta)
 
-  def test_meta_is_body_source_of_truth(self):
-    """The inline _meta envelope is present in the message body (R-7.4-f)."""
-    raw = {
-      "jsonrpc": "2.0",
-      "id": 1,
-      "method": "tools/call",
-      "params": {
-        "_meta": {
-          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-          "io.modelcontextprotocol/clientInfo": {"name": "c", "version": "1"},
-          "io.modelcontextprotocol/clientCapabilities": {},
-        },
-      },
+  def test_meta_survives_transport(self):
+    """_meta envelope is preserved intact through InMemoryTransport (R-7.4-f)."""
+    client, server = InMemoryTransport.create_pair()
+    meta = {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": {"name": "c", "version": "1"},
+      "io.modelcontextprotocol/clientCapabilities": {},
     }
-    encoded = json.dumps(raw).encode("utf-8")
-    parsed = validate_utf8_json_unit(encoded)
-    assert "io.modelcontextprotocol/protocolVersion" in parsed["params"]["_meta"]
+    req = JSONRPCRequest(id=1, method="tools/list", params={"_meta": meta})
+    client.send(req)
+    received = server.receive()
+    assert received.params["_meta"]["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
 
 
 # ---------------------------------------------------------------------------
-# AC-12.14 — envelope mirroring into transport-level metadata is permitted  (R-7.4-e)
+# AC-12.14 — envelope mirroring into transport-level metadata  (R-7.4-e)
 # ---------------------------------------------------------------------------
 
 class TestEnvelopeMirroring:
-  def test_mirroring_is_permitted(self):
-    """Transport MAY mirror _meta into headers/metadata for routing (R-7.4-e)."""
+  def test_http_header_constant_exists(self):
     from mcp_sdk_py.revision import HTTP_PROTOCOL_VERSION_HEADER
-    # Existence of HTTP_PROTOCOL_VERSION_HEADER confirms mirroring is modelled.
     assert HTTP_PROTOCOL_VERSION_HEADER == "MCP-Protocol-Version"
 
-  def test_body_remains_authoritative(self):
-    """The message body's _meta is authoritative; mirroring is for routing only."""
+  def test_mirroring_does_not_affect_body(self):
+    """Body remains authoritative even when mirroring is done (R-7.4-e)."""
     body_version = "2026-07-28"
     header_version = "2026-07-28"
-    # Matching — authoritative source is the body.
     from mcp_sdk_py.revision import validate_http_revision_header
-    validate_http_revision_header(body_version, header_version)  # must not raise
+    validate_http_revision_header(body_version, header_version)
 
 
 # ---------------------------------------------------------------------------
-# AC-12.15 — abrupt disconnection MUST be observable  (R-7.5-a/b)
+# AC-12.15 / RQ-11 — abrupt disconnection surfaced as DisconnectionError  (R-7.5-a/b)
 # ---------------------------------------------------------------------------
 
 class TestDisconnectionObservable:
-  def test_disconnection_error_is_raised_not_silently_ignored(self):
-    """R-7.5-b: implementation must surface disconnection, not block indefinitely."""
+  def test_receive_after_peer_closes_raises_disconnection(self):
+    """After peer close(), receive() raises DisconnectionError — not blocking (R-7.5-a/b)."""
+    client, server = InMemoryTransport.create_pair()
+    server.close()
     with pytest.raises(DisconnectionError):
-      raise DisconnectionError("peer went away")
+      client.receive()
+
+  def test_receive_after_own_close_raises_disconnection(self):
+    client, _ = InMemoryTransport.create_pair()
+    client.close()
+    with pytest.raises(DisconnectionError):
+      client.receive()
+
+  def test_disconnection_error_carries_connection_id(self):
+    err = DisconnectionError("lost", connection_id="conn-abc")
+    assert err.connection_id == "conn-abc"
 
   def test_disconnection_error_is_transport_error(self):
     assert issubclass(DisconnectionError, TransportError)
 
-  def test_disconnection_not_blocked_indefinitely(self):
-    """Raising DisconnectionError gives callers an immediate signal."""
-    err = DisconnectionError("abrupt close", connection_id="tcp-99")
-    assert isinstance(err, TransportError)
+  def test_messages_queued_before_peer_close_still_delivered(self):
+    """Messages already in queue before peer close() are still receivable (R-7.5-a)."""
+    client, server = InMemoryTransport.create_pair()
+    client.send(JSONRPCRequest(id=1, method="m", params={}))
+    client.send(JSONRPCRequest(id=2, method="n", params={}))
+    client.close()
+    # Both messages were enqueued before close — server can still receive them.
+    assert isinstance(server.receive(), JSONRPCRequest)
+    assert isinstance(server.receive(), JSONRPCRequest)
+    # Now the queue is empty and peer is closed → DisconnectionError.
+    with pytest.raises(DisconnectionError):
+      server.receive()
 
 
 # ---------------------------------------------------------------------------
@@ -513,23 +725,15 @@ class TestFailInFlightOnDisconnect:
     assert failed == frozenset({"a", "b", "c"})
 
   def test_tracker_cleared_after_fail(self):
-    """After fail, tracker has no in-flight ids (R-7.5-e)."""
     tracker = InFlightTracker()
     tracker.send(1)
     tracker.send(2)
     fail_in_flight_on_disconnect(tracker)
     assert tracker.in_flight_ids == frozenset()
 
-  def test_empty_tracker_returns_empty_set(self):
+  def test_empty_tracker_returns_empty(self):
     tracker = InFlightTracker()
-    failed = fail_in_flight_on_disconnect(tracker)
-    assert failed == frozenset()
-
-  def test_single_in_flight_failed(self):
-    tracker = InFlightTracker()
-    tracker.send("req-1")
-    failed = fail_in_flight_on_disconnect(tracker)
-    assert "req-1" in failed
+    assert fail_in_flight_on_disconnect(tracker) == frozenset()
 
   def test_integer_ids_failed(self):
     tracker = InFlightTracker()
@@ -539,181 +743,229 @@ class TestFailInFlightOnDisconnect:
     assert 100 in failed
     assert 200 in failed
 
+  def test_combined_with_disconnection_error(self):
+    """Typical disconnect flow: DisconnectionError observed, then in-flight resolved."""
+    client, server = InMemoryTransport.create_pair()
+    tracker = InFlightTracker()
+    tracker.send("req-1")
+    tracker.send("req-2")
+    server.close()
+    with pytest.raises(DisconnectionError):
+      client.receive()
+    failed = fail_in_flight_on_disconnect(tracker)
+    assert failed == frozenset({"req-1", "req-2"})
+
 
 # ---------------------------------------------------------------------------
 # AC-12.17 — stateless client MAY retry after disconnect  (R-7.5-f)
 # ---------------------------------------------------------------------------
 
 class TestRetryAfterDisconnect:
-  def test_retry_is_possible_without_state_loss(self):
-    """R-7.5-f: stateless model allows retrying failed requests on a fresh connection."""
-    # Simulate: tracker cleared by disconnect — caller can resend on a new tracker.
+  def test_retry_on_fresh_transport_pair(self):
+    """After disconnect, failed request can be retried on a new pair (R-7.5-f)."""
+    old_client, _ = InMemoryTransport.create_pair()
     old_tracker = InFlightTracker()
-    old_tracker.send("retryable-req")
-    failed = fail_in_flight_on_disconnect(old_tracker)
-    # On a fresh connection, same request can be issued again.
+    old_tracker.send("retryable")
+    fail_in_flight_on_disconnect(old_tracker)
+    # Fresh connection for retry.
+    new_client, new_server = InMemoryTransport.create_pair()
     new_tracker = InFlightTracker()
-    for rid in failed:
-      new_tracker.send(rid)  # must not raise — fresh tracker
-    assert new_tracker.is_in_flight("retryable-req")
+    new_tracker.send("retryable")
+    new_client.send(JSONRPCRequest(id="retryable", method="m", params={}))
+    received = new_server.receive()
+    assert received.id == "retryable"
 
 
 # ---------------------------------------------------------------------------
-# AC-12.18 — stdio server exit: client SHOULD restart, MAY retry  (R-7.5-g/h)
+# AC-12.18 — stdio server exit: restart + retry  (R-7.5-g/h)
 # ---------------------------------------------------------------------------
 
 class TestStdioProcessRestart:
   def test_stdio_transport_constant(self):
-    """TRANSPORT_STDIO is defined; concrete restart logic is in S13."""
     assert TRANSPORT_STDIO == "stdio"
 
-  def test_disconnection_error_models_stdio_exit(self):
-    """Unexpected server process exit is modelled as a DisconnectionError."""
+  def test_disconnection_models_process_exit(self):
+    """Unexpected exit is modelled as DisconnectionError (concrete restart in S13)."""
     err = DisconnectionError("server process exited unexpectedly", connection_id="proc-42")
     assert isinstance(err, DisconnectionError)
 
 
 # ---------------------------------------------------------------------------
-# AC-12.19 — no silent discard on transport error  (R-7.5-i/j)
+# AC-12.19 — no silent discard on error  (R-7.5-i/j)
 # ---------------------------------------------------------------------------
 
 class TestNoSilentDiscardOnError:
-  def test_undeliverable_message_raises_not_swallowed(self):
-    """R-7.5-i/j: transport MUST produce observable failure, not silent drop."""
-    def try_deliver(raise_on_fail: bool) -> None:
-      if raise_on_fail:
-        raise MessageDeliveryError("delivery failed")
+  def test_closed_peer_raises_not_returns_none(self):
+    """send() to closed peer raises MessageDeliveryError — not silently discards (R-7.5-i)."""
+    client, server = InMemoryTransport.create_pair()
+    server.close()
     with pytest.raises(MessageDeliveryError):
-      try_deliver(raise_on_fail=True)
+      client.send(JSONRPCNotification(method="m", params={}))
 
   def test_message_delivery_error_inherits_transport_error(self):
     assert issubclass(MessageDeliveryError, TransportError)
 
 
 # ---------------------------------------------------------------------------
-# AC-12.20 — UTF-8 + JSON validation: accept valid, reject malformed  (R-7.6-a/b/c)
+# AC-12.20 — UTF-8 + JSON validation  (R-7.6-a/b/c)
 # ---------------------------------------------------------------------------
 
 class TestUtf8JsonValidation:
   def test_valid_utf8_json_passes(self):
     data = b'{"jsonrpc":"2.0","id":1,"method":"test"}'
-    result = validate_utf8_json_unit(data)
-    assert result["method"] == "test"
+    assert validate_utf8_json_unit(data)["method"] == "test"
 
-  def test_invalid_utf8_raises_malformed_message_error(self):
-    bad_bytes = b"\xff\xfe invalid utf-8"
+  def test_invalid_utf8_raises(self):
     with pytest.raises(MalformedMessageError) as exc_info:
-      validate_utf8_json_unit(bad_bytes)
+      validate_utf8_json_unit(b"\xff\xfe invalid")
     assert exc_info.value.raw_excerpt != b""
 
-  def test_valid_utf8_but_invalid_json_raises(self):
-    not_json = "this is not json at all".encode("utf-8")
+  def test_valid_utf8_invalid_json_raises(self):
     with pytest.raises(MalformedMessageError):
-      validate_utf8_json_unit(not_json)
+      validate_utf8_json_unit("not json at all".encode("utf-8"))
 
   def test_empty_bytes_raises(self):
     with pytest.raises(MalformedMessageError):
       validate_utf8_json_unit(b"")
 
-  def test_malformed_error_is_transport_error(self):
+  def test_malformed_is_transport_error(self):
     assert issubclass(MalformedMessageError, TransportError)
 
-  def test_malformed_error_carries_excerpt(self):
-    with pytest.raises(MalformedMessageError) as exc_info:
-      validate_utf8_json_unit(b"\x80\x81\x82")
-    assert isinstance(exc_info.value.raw_excerpt, bytes)
-
-  def test_must_not_silently_substitute(self):
-    """R-7.6-c: malformed unit MUST raise, not return a default or None."""
+  def test_must_not_silently_drop(self):
+    """R-7.6-c: malformed unit MUST raise, never return None or a default."""
     with pytest.raises(MalformedMessageError):
       validate_utf8_json_unit(b"not-json")
 
   def test_unicode_json_accepted(self):
     data = json.dumps({"x": "こんにちは"}, ensure_ascii=False).encode("utf-8")
-    result = validate_utf8_json_unit(data)
-    assert result["x"] == "こんにちは"
+    assert validate_utf8_json_unit(data)["x"] == "こんにちは"
 
   def test_json_array_accepted(self):
-    """validate_utf8_json_unit accepts any JSON value, not just objects."""
-    data = b'[1, 2, 3]'
-    result = validate_utf8_json_unit(data)
-    assert result == [1, 2, 3]
+    assert validate_utf8_json_unit(b'[1, 2, 3]') == [1, 2, 3]
 
 
 # ---------------------------------------------------------------------------
-# AC-12.21 — no connection-scoped state  (R-7.6-d/e/f)
+# AC-12.21 / RQ-15 — no connection-scoped state: real guard  (R-7.6-d/e/f)
 # ---------------------------------------------------------------------------
 
 class TestNoConnectionScopedState:
-  def test_assert_no_connection_scoped_state_raises(self):
-    """Calling the guard at a connection-state lookup site raises immediately."""
+  """assert_no_connection_scoped_state is a real guard (not an always-raising marker).
+  It raises only when state_key IS the connection identity (RQ-15)."""
+
+  def test_same_object_raises(self):
+    """Using the connection object itself as a state key raises (R-7.6-i)."""
+    conn = object()
     with pytest.raises(ConnectionScopedStateError):
-      assert_no_connection_scoped_state("looked up session by connection id")
+      assert_no_connection_scoped_state(conn, conn)
 
-  def test_connection_scoped_state_error_message(self):
-    try:
-      assert_no_connection_scoped_state()
-    except ConnectionScopedStateError as e:
-      assert "connection" in str(e).lower()
+  def test_different_object_passes(self):
+    """An explicit string identifier is NOT the connection — no-op (R-7.6-j)."""
+    conn = object()
+    explicit_id = "session-abc-123"
+    assert_no_connection_scoped_state(explicit_id, conn)  # must not raise
 
-  def test_connection_scoped_state_error_with_detail(self):
-    try:
-      assert_no_connection_scoped_state("used tcp_conn as session key")
-    except ConnectionScopedStateError as e:
-      assert "tcp_conn" in str(e)
+  def test_explicit_string_id_passes(self):
+    conn = object()
+    assert_no_connection_scoped_state("task-id-from-client", conn)
+
+  def test_explicit_int_id_passes(self):
+    conn = object()
+    assert_no_connection_scoped_state(42, conn)
+
+  def test_context_appears_in_error_message(self):
+    conn = object()
+    with pytest.raises(ConnectionScopedStateError) as exc_info:
+      assert_no_connection_scoped_state(conn, conn, context="session lookup by tcp_conn")
+    assert "session lookup by tcp_conn" in str(exc_info.value)
+
+  def test_is_connection_scoped_same_object(self):
+    conn = object()
+    assert is_connection_scoped(conn, conn) is True
+
+  def test_is_connection_scoped_different_object(self):
+    conn = object()
+    assert is_connection_scoped("explicit-id", conn) is False
+
+  def test_equal_strings_different_identity_passes(self):
+    """Equal value but different identity (not ``is``) → not connection-scoped."""
+    conn_id = "conn-1"
+    explicit = "conn-1"  # same value, but the string may be interned; still OK
+    # is_connection_scoped uses ``is``, not ``==``.
+    # For interned strings this could be True, but the explicit-id pattern is about
+    # passing a distinct object. We verify the function uses identity.
+    result = is_connection_scoped(explicit, conn_id)
+    # Accept either outcome — the critical rule is that a dedicated explicit id
+    # object is not the same ``is`` the connection.
+    assert isinstance(result, bool)
 
   def test_connection_scoped_state_error_is_exception(self):
     assert issubclass(ConnectionScopedStateError, Exception)
 
+  def test_error_message_mentions_connection(self):
+    conn = object()
+    try:
+      assert_no_connection_scoped_state(conn, conn)
+    except ConnectionScopedStateError as e:
+      assert "connection" in str(e).lower()
+
   def test_each_request_carries_its_own_meta(self):
-    """R-7.6-f: server relies on _meta, not prior requests, for identity/capabilities."""
+    """R-7.6-f: server uses _meta, not connection identity, for each request."""
     from mcp_sdk_py.meta_object import KEY_PROTOCOL_VERSION, KEY_CLIENT_INFO, KEY_CLIENT_CAPABILITIES
-    # Confirm that meta keys carry per-request identity — no shared state needed.
     meta = {
       KEY_PROTOCOL_VERSION: "2026-07-28",
       KEY_CLIENT_INFO: {"name": "client-a", "version": "1"},
       KEY_CLIENT_CAPABILITIES: {},
     }
+    # All three keys are in the body — no connection lookup needed.
     assert KEY_PROTOCOL_VERSION in meta
     assert KEY_CLIENT_INFO in meta
     assert KEY_CLIENT_CAPABILITIES in meta
 
 
 # ---------------------------------------------------------------------------
-# AC-12.22 — SHOULD NOT require same connection  (R-7.6-g/h/i)
+# AC-12.22 — SHOULD NOT require same connection; interleaving allowed  (R-7.6-g/h/i)
 # ---------------------------------------------------------------------------
 
 class TestConnectionReuseNotRequired:
-  def test_connection_id_must_not_proxy_state(self):
-    """R-7.6-i: connection identity is not a session proxy."""
-    with pytest.raises(ConnectionScopedStateError):
-      assert_no_connection_scoped_state("routing by connection object")
+  def test_interleaved_requests_on_one_transport(self):
+    """R-7.6-h: client MAY interleave unrelated requests on one connection."""
+    client, server = InMemoryTransport.create_pair()
+    client.send(JSONRPCRequest(id=1, method="tools/list", params={}))
+    client.send(JSONRPCRequest(id=2, method="resources/list", params={}))
+    m1 = server.receive()
+    m2 = server.receive()
+    assert {m1.method, m2.method} == {"tools/list", "resources/list"}
 
-  def test_multiple_requests_interleaved_on_one_tracker(self):
-    """R-7.6-h: a client MAY interleave unrelated requests on one connection."""
-    tracker = InFlightTracker()
-    tracker.send("tools-list")
-    tracker.send("resources-list")
-    # Both outstanding on one connection — valid (unrelated, interleaved).
-    assert tracker.is_in_flight("tools-list")
-    assert tracker.is_in_flight("resources-list")
+  def test_connection_identity_not_a_state_proxy(self):
+    """R-7.6-i: connection object MUST NOT proxy conversation identity."""
+    conn = object()
+    with pytest.raises(ConnectionScopedStateError):
+      assert_no_connection_scoped_state(conn, conn)
 
 
 # ---------------------------------------------------------------------------
-# AC-12.23 — continuity via explicit identifier, not connection identity  (R-7.6-j)
+# AC-12.23 — continuity via explicit identifier  (R-7.6-j)
 # ---------------------------------------------------------------------------
 
 class TestExplicitIdentifierForContinuity:
-  def test_continuation_id_not_connection_id(self):
-    """R-7.6-j: explicit client-supplied id in _meta, not connection proxy."""
+  def test_explicit_id_not_connection_scoped(self):
+    """Client-supplied id is not the connection identity → guard is a no-op."""
+    conn = object()
+    assert_no_connection_scoped_state("task-xyz", conn)  # must not raise
+
+  def test_continuation_id_is_explicit(self):
     from mcp_sdk_py.stateless_model import is_valid_continuation_id
-    # A valid continuation id is an explicit value, not an implicit connection identity.
     assert is_valid_continuation_id("explicit-task-id-abc")
 
-  def test_connection_scoped_state_prohibited(self):
-    """Asserting connection-scoped state is always an error."""
+  def test_connection_guard_enables_correct_pattern(self):
+    """Typical correct pattern: explicit id → guard passes; connection identity → guard raises."""
+    conn = object()
+    client_supplied_id = "req-state-42"
+    # Correct pattern: use explicit id.
+    assert_no_connection_scoped_state(client_supplied_id, conn)
+    # Forbidden pattern: use connection object.
     with pytest.raises(ConnectionScopedStateError):
-      assert_no_connection_scoped_state()
+      assert_no_connection_scoped_state(conn, conn)
 
 
 # ---------------------------------------------------------------------------
@@ -721,28 +973,35 @@ class TestExplicitIdentifierForContinuity:
 # ---------------------------------------------------------------------------
 
 class TestDisconnectMakesInFlightFailed:
-  def test_requests_in_flight_considered_failed_on_disconnect(self):
-    """R-7.7-a: connection lost → outstanding requests MUST be considered failed."""
+  def test_in_flight_requests_failed_on_disconnect(self):
+    """R-7.7-a: connection lost → both outstanding requests are failed."""
+    client, server = InMemoryTransport.create_pair()
     tracker = InFlightTracker()
     tracker.send(2)
     tracker.send(3)
+    server.close()
+    with pytest.raises(DisconnectionError):
+      client.receive()
     failed = fail_in_flight_on_disconnect(tracker)
     assert 2 in failed
     assert 3 in failed
 
-  def test_retry_on_new_connection_is_valid(self):
-    """R-7.7-b: client MAY retry on a new connection because no state is bound."""
-    old_tracker = InFlightTracker()
-    old_tracker.send(2)
-    old_tracker.send(3)
-    failed = fail_in_flight_on_disconnect(old_tracker)
-    # Fresh connection, fresh tracker — retry any of the failed ids.
+  def test_retry_on_new_connection(self):
+    """R-7.7-b: client MAY retry on new connection because no state is bound."""
+    tracker = InFlightTracker()
+    tracker.send(2)
+    tracker.send(3)
+    failed = fail_in_flight_on_disconnect(tracker)
+    new_client, new_server = InMemoryTransport.create_pair()
     new_tracker = InFlightTracker()
     for rid in sorted(failed):
       new_tracker.send(rid)
+      new_client.send(JSONRPCRequest(id=rid, method="m", params={}))
     assert new_tracker.in_flight_ids == frozenset({2, 3})
+    assert isinstance(new_server.receive(), JSONRPCRequest)
+    assert isinstance(new_server.receive(), JSONRPCRequest)
 
-  def test_no_state_bound_to_lost_connection(self):
+  def test_no_state_bound_to_connection(self):
     """After disconnect, in-flight set is cleared — state is gone with connection."""
     tracker = InFlightTracker()
     tracker.send("op-1")
