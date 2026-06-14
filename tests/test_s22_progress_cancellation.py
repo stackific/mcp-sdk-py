@@ -29,8 +29,10 @@ Coverage map (26 story ACs + 2 conformance gaps):
   AC-22.26 → TestProgressTokenStringAndNumeric
 
 Conformance gap fixes (story AC numbers from S22 traceability table):
-  AC-22.5  (R-15.1.2-a)     → TestProgressOptIn
-  AC-22.18 (R-15.2.1-a/b)   → TestCancellationWithInFlightTracker
+  AC-22.5  (R-15.1.2-a)          → TestProgressOptIn
+  AC-22.18 (R-15.2.1-a/b)        → TestCancellationWithInFlightTracker
+  AC-22.24 (R-15.2.2-e/f)        → TestReceiveCancellationGraceful
+  AC-22.25/26 (R-15.2.3-a–e)     → TestCancellationRegistry
 """
 
 import pytest
@@ -40,12 +42,14 @@ from mcp_sdk_py.progress import (
   DISCOVER_METHOD,
   PROGRESS_NOTIFICATION_METHOD,
   CancelledNotificationParams,
+  CancellationRegistry,
   CancellationTargetNotInFlightError,
   ProgressNotificationParams,
   ProgressNotOptedInError,
   ProgressTracker,
   build_cancel_notification,
   is_cancellable_method,
+  receive_cancellation,
   validate_cancelled_notification_params,
   validate_progress_notification_params,
   validate_progress_opt_in,
@@ -712,3 +716,155 @@ class TestCancellationWithInFlightTracker:
     tracker.send(99)
     note = build_cancel_notification(tracker, 99)
     assert note.request_id == 99
+
+
+# ---------------------------------------------------------------------------
+# AC-22.24 (R-15.2.2-e/f) — receive_cancellation: graceful no-op for unknown ids
+# ---------------------------------------------------------------------------
+
+class TestReceiveCancellationGraceful:
+  """R-15.2.2-e/f: receiver MAY ignore cancellations for unknown, already-completed,
+  or non-cancellable requests.  receive_cancellation() encodes that grace."""
+
+  def test_unknown_id_returns_false(self):
+    """No tracker at all → graceful no-op."""
+    assert receive_cancellation(None, "unknown-id") is False
+
+  def test_unknown_id_with_empty_tracker_returns_false(self):
+    """Empty InFlightTracker has no in-flight requests."""
+    tracker = InFlightTracker()
+    assert receive_cancellation(tracker, "unknown-id") is False
+
+  def test_in_flight_id_returns_true(self):
+    """id is in-flight → actionable cancellation."""
+    tracker = InFlightTracker()
+    tracker.send("req-1")
+    assert receive_cancellation(tracker, "req-1") is True
+
+  def test_completed_id_returns_false(self):
+    """After receive(), id leaves in-flight → graceful no-op."""
+    tracker = InFlightTracker()
+    tracker.send("req-2")
+    tracker.receive("req-2")
+    assert receive_cancellation(tracker, "req-2") is False
+
+  def test_non_cancellable_method_returns_false(self):
+    """server/discover is not cancellable regardless of in-flight state."""
+    tracker = InFlightTracker()
+    tracker.send("req-3")
+    assert receive_cancellation(tracker, "req-3", method=DISCOVER_METHOD) is False
+
+  def test_cancellable_method_in_flight_returns_true(self):
+    """Explicit cancellable method + in-flight → True."""
+    tracker = InFlightTracker()
+    tracker.send("req-4")
+    assert receive_cancellation(tracker, "req-4", method="tools/call") is True
+
+  def test_none_tracker_always_false(self):
+    """tracker=None → receiver has no in-flight book → False for any id."""
+    assert receive_cancellation(None, "any-id", method="tools/call") is False
+
+  def test_integer_request_id(self):
+    """Integer ids work the same way (JSON-RPC id can be number)."""
+    tracker = InFlightTracker()
+    tracker.send(7)
+    assert receive_cancellation(tracker, 7) is True
+    assert receive_cancellation(tracker, 8) is False
+
+  def test_method_none_skips_cancellable_check(self):
+    """method=None means no method filter — in-flight alone decides."""
+    tracker = InFlightTracker()
+    tracker.send("req-5")
+    assert receive_cancellation(tracker, "req-5", method=None) is True
+
+
+# ---------------------------------------------------------------------------
+# AC-22.25/26 (R-15.2.3-a–e) — CancellationRegistry: race-tolerance for late responses
+# ---------------------------------------------------------------------------
+
+class TestCancellationRegistry:
+  """R-15.2.3-a–e: after a request is cancelled, a late response for that id
+  must be silently dropped.  CancellationRegistry tracks cancelled ids and
+  answers should_ignore_response(id)."""
+
+  def test_cancel_and_ignore(self):
+    """Cancelled id → should_ignore_response returns True."""
+    reg = CancellationRegistry()
+    reg.cancel("req-1")
+    assert reg.should_ignore_response("req-1") is True
+
+  def test_not_cancelled_not_ignored(self):
+    """Id never cancelled → should_ignore_response returns False."""
+    reg = CancellationRegistry()
+    assert reg.should_ignore_response("req-1") is False
+
+  def test_forget_clears_entry(self):
+    """forget() removes the id; late responses are no longer suppressed."""
+    reg = CancellationRegistry()
+    reg.cancel("req-1")
+    reg.forget("req-1")
+    assert reg.should_ignore_response("req-1") is False
+
+  def test_forget_unknown_is_noop(self):
+    """forget() on an id that was never cancelled must not raise."""
+    reg = CancellationRegistry()
+    reg.forget("phantom")  # must not raise
+
+  def test_cancelled_ids_property(self):
+    """cancelled_ids returns a frozenset of all currently cancelled ids."""
+    reg = CancellationRegistry()
+    reg.cancel("a")
+    reg.cancel("b")
+    assert reg.cancelled_ids == frozenset({"a", "b"})
+
+  def test_cancelled_ids_empty_initially(self):
+    reg = CancellationRegistry()
+    assert reg.cancelled_ids == frozenset()
+
+  def test_cancelled_ids_shrinks_after_forget(self):
+    reg = CancellationRegistry()
+    reg.cancel("a")
+    reg.cancel("b")
+    reg.forget("a")
+    assert reg.cancelled_ids == frozenset({"b"})
+
+  def test_integer_id_distinguished_from_string(self):
+    """int 1 and str '1' are different request ids (JSON-RPC: both valid but distinct)."""
+    reg = CancellationRegistry()
+    reg.cancel(1)
+    assert reg.should_ignore_response(1) is True
+    assert reg.should_ignore_response("1") is False
+
+  def test_string_id_distinguished_from_integer(self):
+    reg = CancellationRegistry()
+    reg.cancel("1")
+    assert reg.should_ignore_response("1") is True
+    assert reg.should_ignore_response(1) is False
+
+  def test_multiple_cancels_same_id_idempotent(self):
+    """Cancelling the same id twice must not raise or corrupt state."""
+    reg = CancellationRegistry()
+    reg.cancel("req-x")
+    reg.cancel("req-x")
+    assert reg.should_ignore_response("req-x") is True
+
+  def test_late_response_workflow(self):
+    """Simulate: send → cancel → late response arrives → should be ignored."""
+    tracker = InFlightTracker()
+    reg = CancellationRegistry()
+
+    tracker.send("req-late")
+    # Client decides to cancel.
+    assert receive_cancellation(tracker, "req-late") is True
+    reg.cancel("req-late")
+    # Cancellation notification sent; server may still reply.
+    # Late response arrives — check if it should be ignored.
+    assert reg.should_ignore_response("req-late") is True
+    # After processing (ignoring) the late response, clean up.
+    reg.forget("req-late")
+    assert reg.should_ignore_response("req-late") is False
+
+  def test_normal_response_workflow(self):
+    """Non-cancelled id → should not be ignored → normal handling."""
+    reg = CancellationRegistry()
+    assert reg.should_ignore_response("req-normal") is False
